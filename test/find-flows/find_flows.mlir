@@ -18,9 +18,13 @@
 // CHECK:   AIE.packet_source<%[[T22]], DMA : 0>
 // CHECK:   AIE.packet_dest<%[[T23]], DMA : 1>
 // CHECK: }
-module {
+module @vck190{
+  AIE.device("vck190")  
+  
   %tile0 = AIE.tile(2, 3)
   %tile1 = AIE.tile(2, 2)
+
+  %l33_0 = AIE.lock(%tile1, 0)
 
   %0 = AIE.switchbox(%tile0) {
     AIE.connect<Core :0, South:1>

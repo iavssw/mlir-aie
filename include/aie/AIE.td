@@ -73,6 +73,20 @@ def AnyScalar : TypeConstraint<Or<[Index.predicate,
                                    AnyFloat.predicate]>,
                                   "scalar">;
 
+def AIE_DeviceOp: AIE_Op<"device", []> {
+  let summary = "Define device";
+  let description = [{
+    blablabla.
+  }];
+  let arguments = (
+    ins StrAttr:$deviceName
+  );
+  let assemblyFormat = [{
+    `(` $deviceName `)` attr-dict
+  }];
+
+}                                  
+
 def AIE_TileOp: AIE_Op<"tile", [FlowEndPoint]>, Results<(outs Index:$result)> {
   let arguments = (
     ins Confined<I32Attr, [IntMinValue<0>]>:$col,

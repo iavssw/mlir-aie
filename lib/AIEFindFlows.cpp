@@ -264,6 +264,8 @@ struct AIEFindFlowsPass : public AIEFindFlowsBase<AIEFindFlowsPass> {
     for (auto tile : m.getOps<TileOp>()) {
       findFlowsFrom(tile, analysis, builder);
     }
+
+    /////////////////////////test
   }
 };
 

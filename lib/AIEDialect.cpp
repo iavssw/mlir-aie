@@ -197,6 +197,15 @@ LogicalResult xilinx::AIE::SwitchboxOp::verify() {
   DenseSet<xilinx::AIE::Port> destset;
   assert(getOperation()->getNumRegions());
   assert(!body.empty());
+
+  llvm::dbgs() << "starting verify\n";
+  Operation *m = getOperation()->getParentOp();
+
+  for (auto device : m->getOps<DeviceOp>()) {
+    llvm::dbgs() << "devicename\n";
+    llvm::dbgs() << device.deviceName() << "\n";
+  }
+
   for (auto &ops : body.front()) {
     if (auto connectOp = dyn_cast<xilinx::AIE::ConnectOp>(ops)) {
       xilinx::AIE::Port source =
@@ -590,7 +599,7 @@ namespace AIE {
 //   odsState.addTypes(resultType0);
 // }
 
-//#include "ATenOpInterfaces.cpp.inc"
+// #include "ATenOpInterfaces.cpp.inc"
 
 int SwitchboxOp::getNumSourceConnections(WireBundle bundle) {
   if (getTileOp().isShimTile())
