@@ -201,7 +201,9 @@ LogicalResult xilinx::AIE::SwitchboxOp::verify() {
   llvm::dbgs() << "starting verify\n";
   Operation *m = getOperation()->getParentOp();
 
-  for (auto device : m->getOps<DeviceOp>()) {
+  Block &b = m->getRegions().begin()->front();
+
+  for (auto device : b.getOps<DeviceOp>()) {
     llvm::dbgs() << "devicename\n";
     llvm::dbgs() << device.deviceName() << "\n";
   }
