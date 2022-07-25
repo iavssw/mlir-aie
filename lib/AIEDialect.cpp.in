@@ -17,6 +17,10 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
 
+#include "mlir/Support/FileUtilities.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+
 using namespace mlir;
 
 namespace {
@@ -197,16 +201,6 @@ LogicalResult xilinx::AIE::SwitchboxOp::verify() {
   DenseSet<xilinx::AIE::Port> destset;
   assert(getOperation()->getNumRegions());
   assert(!body.empty());
-
-  llvm::dbgs() << "starting verify\n";
-  Operation *m = getOperation()->getParentOp();
-
-  Block &b = m->getRegions().begin()->front();
-
-  for (auto device : b.getOps<DeviceOp>()) {
-    llvm::dbgs() << "devicename\n";
-    llvm::dbgs() << device.deviceName() << "\n";
-  }
 
   for (auto &ops : body.front()) {
     if (auto connectOp = dyn_cast<xilinx::AIE::ConnectOp>(ops)) {
@@ -517,6 +511,66 @@ template <typename... ParentOpTypes> struct HasSomeParent {
     return failure();
   }
 };
+
+llvm::Optional<int64_t> readDeviceProfile(std::string device,
+                                          std::string variable) {
+
+  // read device profile located in ${DEVICEJSON} configured by CMAKE during
+  // build time
+  std::string errorMessage;
+  auto fileJson = mlir::openInputFile("${DEVICEJSON}", &errorMessage);
+  if (!fileJson) {
+    llvm::errs() << errorMessage << "\n";
+    return None;
+  }
+  auto fileRaw = llvm::json::parse(fileJson->getBuffer());
+  if (!fileRaw) {
+    llvm::errs() << "failed to parse the target spec json file\n";
+    return None;
+  }
+  auto fileObj = fileRaw.get().getAsObject();
+  if (!fileObj) {
+    llvm::errs() << "support an object in the target spec json file, found "
+                    "something else\n";
+    return None;
+  }
+
+  auto deviceObj = fileObj->getObject(device);
+  llvm::Optional<int64_t> deviceVariable = deviceObj->getInteger(variable);
+
+  return deviceVariable;
+}
+
+// lockOp
+LogicalResult xilinx::AIE::LockOp::verify() {
+
+  // llvm::dbgs() << "starting lockID verify\n";
+  // Operation *op_parent = getOperation()->getParentOp();
+
+  // // get ModuleOP and find device definition
+  // ModuleOp m;
+  // while (!(m = dyn_cast_or_null<ModuleOp>(op_parent))) {
+  //   op_parent = op_parent->getParentOp();
+  // }
+  // Block &b = m->getRegions().begin()->front();
+  // for (auto device : b.getOps<DeviceOp>()) {
+  //   llvm::dbgs() << "devicename: " << VCK190_lockID_min << "\n";
+  //   llvm::dbgs() << device.deviceName() << "\n";
+  // }
+
+  auto deviceLockIDmin = readDeviceProfile("vck190", "lockID_min");
+  if (!deviceLockIDmin.hasValue()) {
+    llvm::errs() << "vck190 'lockID_min' is not defined in device.json\n";
+    return failure();
+  }
+
+  int testint = deviceLockIDmin.getValue();
+
+  llvm::dbgs() << "testing\n";
+  llvm::dbgs() << testint << "\n";
+
+  return success();
+}
 
 struct UsesOneLockInDMABlock {
   static LogicalResult verifyTrait(Operation *op) {

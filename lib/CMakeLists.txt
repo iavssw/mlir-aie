@@ -5,9 +5,14 @@
 #
 # (c) Copyright 2021 Xilinx Inc.
 
+# gets the absolute path to the device.json file
+# updates DEVICEJSON variable for "AIEDialect.cpp.in"
+get_filename_component(DEVICEJSON "../include/device.json" ABSOLUTE)
+configure_file(AIEDialect.cpp.in AIEDialect.cpp)
+
 add_mlir_dialect_library(AIE
   AIEAssignBuffers.cpp
-  AIEDialect.cpp
+  ${AIE_BINARY_DIR}/lib/AIEDialect.cpp
   AIETokenAnalysis.cpp
   AIENetlistAnalysis.cpp
   AIEFindFlows.cpp

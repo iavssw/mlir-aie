@@ -1,0 +1,1 @@
+#define VCK190_lockID_min 1
