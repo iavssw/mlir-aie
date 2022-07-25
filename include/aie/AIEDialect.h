@@ -45,10 +45,13 @@ class FlowEndPoint : public OpTrait::TraitBase<ConcreteType, FlowEndPoint> {};
 namespace xilinx {
 namespace AIE {
 
+llvm::Optional<int64_t> readDeviceProfile(std::string device,
+                                                       std::string variable);
+
 void registerAIETranslations();
 
 // FIXME: use this
-//#include "AIEDialect.h.inc"
+// #include "AIEDialect.h.inc"
 
 // The Dialect
 class AIEDialect : public mlir::Dialect {
@@ -107,7 +110,7 @@ public:
 //////////////////// Custom Operations for the Dialect /////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
 
-//#include "AIEOpInterfaces.h.inc"
+// #include "AIEOpInterfaces.h.inc"
 
 typedef std::pair<WireBundle, int> Port;
 typedef std::pair<Port, Port> Connect;

@@ -512,8 +512,8 @@ template <typename... ParentOpTypes> struct HasSomeParent {
   }
 };
 
-llvm::Optional<int64_t> readDeviceProfile(std::string device,
-                                          std::string variable) {
+llvm::Optional<int64_t> xilinx::AIE::readDeviceProfile(std::string device,
+                                                       std::string variable) {
 
   // read device profile located in ${DEVICEJSON} configured by CMAKE during
   // build time
@@ -558,7 +558,7 @@ LogicalResult xilinx::AIE::LockOp::verify() {
   //   llvm::dbgs() << device.deviceName() << "\n";
   // }
 
-  auto deviceLockIDmin = readDeviceProfile("vck190", "lockID_min");
+  auto deviceLockIDmin = xilinx::AIE::readDeviceProfile("vck190", "lockID_min");
   if (!deviceLockIDmin.hasValue()) {
     llvm::errs() << "vck190 'lockID_min' is not defined in device.json\n";
     return failure();
