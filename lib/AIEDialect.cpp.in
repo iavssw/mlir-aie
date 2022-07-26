@@ -177,6 +177,49 @@ AIEDialect::AIEDialect(mlir::MLIRContext *ctx)
 } // namespace AIE
 } // namespace xilinx
 
+std::string device;
+
+LogicalResult xilinx::AIE::DeviceOp::verify() {
+
+  Operation *m = getOperation()->getParentOp();
+  if (!llvm::isa<ModuleOp>(m)) {
+    llvm::dbgs() << "DeviceOp not in defined in the root nested region\n";
+    return failure();
+  }
+
+  bool found = false;
+  bool firstOp = false;
+  for (Region &region : m->getRegions()) {
+    for (Block &block : region.getBlocks()) {
+      for (Operation &op : block.getOperations()) {
+        if (llvm::isa<xilinx::AIE::DeviceOp>(op)) {
+          if (found) {
+            llvm::dbgs() << "DeviceOp can only be defined once\n";
+            return failure();
+          }
+          if (firstOp) {
+            llvm::dbgs() << "DeviceOp is not the first operation\n";
+            return failure();
+          }
+          found = true;
+        }
+        if (!firstOp)
+          firstOp = true;
+      }
+    }
+  }
+
+  xilinx::AIE::DeviceOp deviceOp =
+      dyn_cast<xilinx::AIE::DeviceOp>(getOperation());
+
+  llvm::dbgs() << "devicename read\n";
+  llvm::dbgs() << deviceOp.deviceName() << "\n";
+
+  device = (std::string)deviceOp.deviceName();
+
+  return success();
+}
+
 LogicalResult xilinx::AIE::TileOp::verify() {
   auto users = result().getUsers();
   bool found = false;
@@ -187,6 +230,9 @@ LogicalResult xilinx::AIE::TileOp::verify() {
       found = true;
     }
   }
+
+  llvm::dbgs() << "global read\n";
+  llvm::dbgs() << device << "\n";
 
   return success();
 }
@@ -273,6 +319,7 @@ LogicalResult xilinx::AIE::SwitchboxOp::verify() {
       }
     } else if (auto amselOp = dyn_cast<xilinx::AIE::AMSelOp>(ops)) {
     } else if (auto endswitchOp = dyn_cast<xilinx::AIE::EndOp>(ops)) {
+    } else if (auto endswitchOp = dyn_cast<xilinx::AIE::DeviceOp>(ops)) {
     } else {
       return ops.emitOpError("cannot be contained in a Switchbox op");
     }
@@ -590,7 +637,7 @@ namespace AIE {
 //   odsState.addTypes(resultType0);
 // }
 
-//#include "ATenOpInterfaces.cpp.inc"
+// #include "ATenOpInterfaces.cpp.inc"
 
 int SwitchboxOp::getNumSourceConnections(WireBundle bundle) {
   if (getTileOp().isShimTile())

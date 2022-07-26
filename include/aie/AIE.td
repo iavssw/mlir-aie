@@ -73,6 +73,26 @@ def AnyScalar : TypeConstraint<Or<[Index.predicate,
                                    AnyFloat.predicate]>,
                                   "scalar">;
 
+def AIE_DeviceOp: AIE_Op<"device", []> {
+  let summary = "Define device";
+  let description = [{
+    This operation defines the device used. From this definition, device specific 
+    variables are read from the JSON file located in the include directory. These
+    variables are verified for each operation that uses the variable to ensure 
+    correct operation. 
+
+    Example:
+    ```
+      AIE.device("vck190")
+    ```
+  }];
+  let arguments = (ins StrAttr:$deviceName);
+  let assemblyFormat = [{
+    `(` $deviceName `)` attr-dict
+  }];
+  let hasVerifier = 1;
+}                                  
+
 def AIE_TileOp: AIE_Op<"tile", [FlowEndPoint]>, Results<(outs Index:$result)> {
   let arguments = (
     ins Confined<I32Attr, [IntMinValue<0>]>:$col,
