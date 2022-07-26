@@ -13,9 +13,12 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/FoldInterfaces.h"
+#include "mlir/Support/FileUtilities.h"
 #include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 using namespace mlir;
 
@@ -179,14 +182,67 @@ AIEDialect::AIEDialect(mlir::MLIRContext *ctx)
 
 std::string device;
 
+class deviceSpecification {
+  bool initialized = false;
+  int lockIDmin;
+  int lockIDmax;
+
+public:
+  bool initializeDevice(llvm::StringRef deviceName) {
+    // read device profile located in ${DEVICEJSON} configured by CMAKE during
+    // build time
+    std::string errorMessage;
+    auto fileJson = mlir::openInputFile("${DEVICEJSON}", &errorMessage);
+    if (!fileJson) {
+      llvm::errs() << errorMessage << "\n";
+      return false;
+    }
+    auto fileRaw = llvm::json::parse(fileJson->getBuffer());
+    if (!fileRaw) {
+      llvm::errs() << "failed to parse the device spec json file\n";
+      return false;
+    }
+    auto fileObj = fileRaw.get().getAsObject();
+    if (!fileObj) {
+      llvm::errs() << "failed to get object\n";
+      return false;
+    }
+    auto deviceObj = fileObj->getObject(deviceName);
+
+    // lockIDmin
+    auto OptionallockIDmin = deviceObj->getInteger("lockIDmin");
+    if (!OptionallockIDmin.hasValue()) {
+      llvm::errs() << "lockIDmin is not defined for: " << deviceName << " \n";
+      return false;
+    }
+    lockIDmin = OptionallockIDmin.getValue();
+
+    // lockIDmax
+    auto OptionallockIDmax = deviceObj->getInteger("lockIDmax");
+    if (!OptionallockIDmax.hasValue()) {
+      llvm::errs() << "lockIDmax is not defined for: " << deviceName << " \n";
+      return false;
+    }
+    lockIDmax = OptionallockIDmin.getValue();
+
+    initialized = true;
+    return true;
+  }
+};
+deviceSpecification deviceSpec;
+
 LogicalResult xilinx::AIE::DeviceOp::verify() {
 
+  // check that the DeviceOp is in the root module region.
   Operation *m = getOperation()->getParentOp();
   if (!llvm::isa<ModuleOp>(m)) {
     llvm::dbgs() << "DeviceOp not in defined in the root nested region\n";
     return failure();
   }
 
+  // DeviceOp should only be defined once and be the first operation in the
+  // root module region. DeviceOp inside recursive nested regions are not
+  // checked as this is check in the previous if statement.
   bool found = false;
   bool firstOp = false;
   for (Region &region : m->getRegions()) {
@@ -209,13 +265,15 @@ LogicalResult xilinx::AIE::DeviceOp::verify() {
     }
   }
 
+  // get device name
   xilinx::AIE::DeviceOp deviceOp =
       dyn_cast<xilinx::AIE::DeviceOp>(getOperation());
 
-  llvm::dbgs() << "devicename read\n";
-  llvm::dbgs() << deviceOp.deviceName() << "\n";
-
-  device = (std::string)deviceOp.deviceName();
+  if (!deviceSpec.initializeDevice(deviceOp.deviceName())) {
+    llvm::dbgs() << "failed to initialize device specifications, update "
+                    "include/devices.json\n";
+    return failure();
+  }
 
   return success();
 }
@@ -230,10 +288,6 @@ LogicalResult xilinx::AIE::TileOp::verify() {
       found = true;
     }
   }
-
-  llvm::dbgs() << "global read\n";
-  llvm::dbgs() << device << "\n";
-
   return success();
 }
 
@@ -541,6 +595,9 @@ xilinx::AIE::TileOp xilinx::AIE::SwitchboxOp::getTileOp() {
 }
 int xilinx::AIE::SwitchboxOp::colIndex() { return getTileOp().colIndex(); }
 int xilinx::AIE::SwitchboxOp::rowIndex() { return getTileOp().rowIndex(); }
+
+//////////////////////////////////////////////////////////////////////////////////
+LogicalResult xilinx::AIE::LockOp::verify() { return success(); }
 
 template <typename... ParentOpTypes> struct HasSomeParent {
   static LogicalResult verifyTrait(Operation *op) {

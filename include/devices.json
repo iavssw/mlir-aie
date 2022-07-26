@@ -1,5 +1,6 @@
 {
     "vck190": {
-        "lockID_min": 2
+        "lockIDmin": 0,
+        "lockIDmax": 15
     }
 } 

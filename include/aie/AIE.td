@@ -962,6 +962,7 @@ def AIE_LockOp: AIE_Op<"lock", []>, Results<(outs Index)> {
         Confined<I32Attr, [IntMinValue<0>, IntMaxValue<15>]>:$lockID
   );
   let assemblyFormat = [{ `(` $tile `,` $lockID `)` attr-dict }];
+  let hasVerifier = 1;
   let extraClassDeclaration = [{
     int getLockID() { return lockID(); }
   }];
