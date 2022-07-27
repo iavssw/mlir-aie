@@ -184,6 +184,10 @@ std::string device;
 
 class deviceSpecification {
   bool initialized = false;
+  uint32_t amselArbiterIDmin;
+  uint32_t amselArbiterIDmax;
+  uint32_t amselMselmin;
+  uint32_t amselMselmax;
   uint32_t lockIDmin;
   uint32_t lockIDmax;
 
@@ -215,6 +219,61 @@ public:
       return false;
     }
 
+    // auto Optional = deviceObj->getInteger("");
+    // if (!Optional.hasValue()) {
+    //   llvm::errs() << " is not defined for: " << deviceName << " \n";
+    //   return false;
+    // } else if (Optional.getValue() < 0) {
+    //   llvm::errs() << " is not a positive integer\n";
+    //   return false;
+    // }
+    //  = Optional.getValue();
+
+    // amselArbiterIDmin
+    auto OptionalAmselArbiterIDmin = deviceObj->getInteger("amselArbiterIDmin");
+    if (!OptionalAmselArbiterIDmin.hasValue()) {
+      llvm::errs() << "amselArbiterIDmin is not defined for: " << deviceName
+                   << " \n";
+      return false;
+    } else if (OptionalAmselArbiterIDmin.getValue() < 0) {
+      llvm::errs() << "amselArbiterIDmin is not a positive integer\n";
+      return false;
+    }
+    amselArbiterIDmin = OptionalAmselArbiterIDmin.getValue();
+    // amselArbiterIDmax
+    auto OptionalAmselArbiterIDmax = deviceObj->getInteger("amselArbiterIDmax");
+    if (!OptionalAmselArbiterIDmax.hasValue()) {
+      llvm::errs() << "amselArbiterIDmax is not defined for: " << deviceName
+                   << " \n";
+      return false;
+    } else if (OptionalAmselArbiterIDmax.getValue() < 0) {
+      llvm::errs() << "amselArbiterIDmax is not a positive integer\n";
+      return false;
+    }
+    amselArbiterIDmax = OptionalAmselArbiterIDmax.getValue();
+    // amselMselmin
+    auto OptionalAmselMselmin = deviceObj->getInteger("amselMselmin");
+    if (!OptionalAmselMselmin.hasValue()) {
+      llvm::errs() << "amselMselmin is not defined for: " << deviceName
+                   << " \n";
+      return false;
+    } else if (OptionalAmselMselmin.getValue() < 0) {
+      llvm::errs() << "amselMselmin is not a positive integer\n";
+      return false;
+    }
+    amselMselmin = OptionalAmselMselmin.getValue();
+    // amselMselmax
+    auto OptionalAmselMselmax = deviceObj->getInteger("amselMselmax");
+    if (!OptionalAmselMselmax.hasValue()) {
+      llvm::errs() << "amselMselmax is not defined for: " << deviceName
+                   << " \n";
+      return false;
+    } else if (OptionalAmselMselmax.getValue() < 0) {
+      llvm::errs() << "amselMselmax is not a positive integer\n";
+      return false;
+    }
+    amselMselmax = OptionalAmselMselmax.getValue();
+
     // lockIDmin
     auto OptionallockIDmin = deviceObj->getInteger("lockIDmin");
     if (!OptionallockIDmin.hasValue()) {
@@ -225,7 +284,6 @@ public:
       return false;
     }
     lockIDmin = OptionallockIDmin.getValue();
-
     // lockIDmax
     auto OptionallockIDmax = deviceObj->getInteger("lockIDmax");
     if (!OptionallockIDmax.hasValue()) {
@@ -241,6 +299,10 @@ public:
     return true;
   }
 
+  uint32_t getamselArbiterIDmin() { return amselArbiterIDmin; };
+  uint32_t getamselArbiterIDmax() { return amselArbiterIDmax; };
+  uint32_t getamselMselmin() { return amselMselmin; };
+  uint32_t getamselMselmax() { return amselMselmax; };
   uint32_t getLockIDmin() { return lockIDmin; }
   uint32_t getLockIDmax() { return lockIDmax; }
 };
@@ -543,6 +605,40 @@ int xilinx::AIE::CoreOp::colIndex() { return getTileOp().colIndex(); }
 int xilinx::AIE::CoreOp::rowIndex() { return getTileOp().rowIndex(); }
 xilinx::AIE::TileOp xilinx::AIE::CoreOp::getTileOp() {
   return cast<xilinx::AIE::TileOp>(tile().getDefiningOp());
+}
+
+//
+LogicalResult xilinx::AIE::AMSelOp::verify() {
+
+  if (!deviceSpec.isInitialized()) {
+    llvm::dbgs() << "device specifications not defined\n";
+    return failure();
+  }
+
+  auto amSelOp = dyn_cast<xilinx::AIE::AMSelOp>(getOperation());
+
+  // arbiterID
+  if (amSelOp.arbiterID() < deviceSpec.getamselArbiterIDmin()) {
+    amSelOp.emitError() << "arbiterID is smaller than the minimum value of '"
+                       << deviceSpec.getamselArbiterIDmin() << "'\n";
+    return failure();
+  } else if (amSelOp.arbiterID() > deviceSpec.getamselArbiterIDmax()) {
+    amSelOp.emitError() << "arbiterID is larger than the maximum value of '"
+                       << deviceSpec.getamselArbiterIDmax() << "'\n";
+    return failure();
+  }
+  // msel
+  if (amSelOp.msel() < deviceSpec.getamselMselmin()) {
+    amSelOp.emitError() << "msel is smaller than the minimum value of '"
+                       << deviceSpec.getamselMselmin() << "'\n";
+    return failure();
+  } else if (amSelOp.msel() > deviceSpec.getamselMselmax()) {
+    amSelOp.emitError() << "msel is larger than the maximum value of '"
+                       << deviceSpec.getamselMselmax() << "'\n";
+    return failure();
+  }
+
+  return success();
 }
 
 // BufferOp

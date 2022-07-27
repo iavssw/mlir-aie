@@ -495,8 +495,8 @@ def AIE_ConnectionOp: AIE_Op<"connection", []> {
 
 def AIE_AMSelOp: AIE_Op<"amsel", [HasParent<"SwitchboxOp">]>, Results<(outs Index)> {
   let arguments = (
-    ins Confined<I8Attr, [IntMinValue<0>, IntMaxValue<5>]>:$arbiterID,
-        Confined<I8Attr, [IntMinValue<0>, IntMaxValue<3>]>:$msel
+    ins I8Attr:$arbiterID,
+        I8Attr:$msel
   );
   let summary = "Declare an arbiter of a switchbox with a master select value (arbiter + msel)";
   let description = [{
@@ -522,6 +522,7 @@ def AIE_AMSelOp: AIE_Op<"amsel", [HasParent<"SwitchboxOp">]>, Results<(outs Inde
   let assemblyFormat = [{
     `<` $arbiterID `>` `(` $msel `)` attr-dict
   }];
+  let hasVerifier = 1;
   let extraClassDeclaration = [{
     int arbiterIndex() { return arbiterID(); }
     int getMselValue() { return msel(); }

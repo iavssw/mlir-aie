@@ -1,5 +1,9 @@
 {
     "vck190": {
+        "amselArbiterIDmin": 0,
+        "amselArbiterIDmax": 5,
+        "amselMselmin": 0,
+        "amselMselmax": 3,
         "lockIDmin": 0,
         "lockIDmax": 15
     }
