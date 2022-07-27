@@ -959,7 +959,7 @@ def AIE_LockOp: AIE_Op<"lock", []>, Results<(outs Index)> {
   }];
   let arguments = (
     ins Index:$tile,
-        Confined<I32Attr, [IntMinValue<0>, IntMaxValue<15>]>:$lockID
+        I32Attr:$lockID
   );
   let assemblyFormat = [{ `(` $tile `,` $lockID `)` attr-dict }];
   let hasVerifier = 1;

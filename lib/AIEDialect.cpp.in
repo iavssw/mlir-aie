@@ -184,10 +184,12 @@ std::string device;
 
 class deviceSpecification {
   bool initialized = false;
-  int lockIDmin;
-  int lockIDmax;
+  uint32_t lockIDmin;
+  uint32_t lockIDmax;
 
 public:
+  bool isInitialized() { return initialized; }
+
   bool initializeDevice(llvm::StringRef deviceName) {
     // read device profile located in ${DEVICEJSON} configured by CMAKE during
     // build time
@@ -208,11 +210,18 @@ public:
       return false;
     }
     auto deviceObj = fileObj->getObject(deviceName);
+    if (!deviceObj) {
+      llvm::errs() << "failed to find device object\n";
+      return false;
+    }
 
     // lockIDmin
     auto OptionallockIDmin = deviceObj->getInteger("lockIDmin");
     if (!OptionallockIDmin.hasValue()) {
       llvm::errs() << "lockIDmin is not defined for: " << deviceName << " \n";
+      return false;
+    } else if (OptionallockIDmin.getValue() < 0) {
+      llvm::errs() << "lockIDmin is not a positive integer\n";
       return false;
     }
     lockIDmin = OptionallockIDmin.getValue();
@@ -222,12 +231,18 @@ public:
     if (!OptionallockIDmax.hasValue()) {
       llvm::errs() << "lockIDmax is not defined for: " << deviceName << " \n";
       return false;
+    } else if (OptionallockIDmax.getValue() < 0) {
+      llvm::errs() << "lockIDmax is not a positive integer\n";
+      return false;
     }
-    lockIDmax = OptionallockIDmin.getValue();
+    lockIDmax = OptionallockIDmax.getValue();
 
     initialized = true;
     return true;
   }
+
+  uint32_t getLockIDmin() { return lockIDmin; }
+  uint32_t getLockIDmax() { return lockIDmax; }
 };
 deviceSpecification deviceSpec;
 
@@ -373,7 +388,6 @@ LogicalResult xilinx::AIE::SwitchboxOp::verify() {
       }
     } else if (auto amselOp = dyn_cast<xilinx::AIE::AMSelOp>(ops)) {
     } else if (auto endswitchOp = dyn_cast<xilinx::AIE::EndOp>(ops)) {
-    } else if (auto endswitchOp = dyn_cast<xilinx::AIE::DeviceOp>(ops)) {
     } else {
       return ops.emitOpError("cannot be contained in a Switchbox op");
     }
@@ -596,8 +610,34 @@ xilinx::AIE::TileOp xilinx::AIE::SwitchboxOp::getTileOp() {
 int xilinx::AIE::SwitchboxOp::colIndex() { return getTileOp().colIndex(); }
 int xilinx::AIE::SwitchboxOp::rowIndex() { return getTileOp().rowIndex(); }
 
-//////////////////////////////////////////////////////////////////////////////////
-LogicalResult xilinx::AIE::LockOp::verify() { return success(); }
+LogicalResult xilinx::AIE::LockOp::verify() {
+
+  if (!deviceSpec.isInitialized()) {
+    llvm::dbgs() << "device specifications not defined\n";
+    return failure();
+  }
+
+  // when lockID is optional
+  // auto lockOp = dyn_cast<xilinx::AIE::LockOp>(getOperation());
+  // // if lockID is not assiged verification is skipped
+  // if (!lockOp.lockID().hasValue()) {
+  //   return success();
+  // }
+
+  auto lockOp = dyn_cast<xilinx::AIE::LockOp>(getOperation());
+
+  if (lockOp.lockID() < deviceSpec.getLockIDmin()) {
+    lockOp.emitError() << "lockID is smaller than the minimum value of '"
+                       << deviceSpec.getLockIDmin() << "'\n";
+    return failure();
+  } else if (lockOp.lockID() > deviceSpec.getLockIDmax()) {
+    lockOp.emitError() << "lockID is larger than the maximum value of '"
+                       << deviceSpec.getLockIDmax() << "'\n";
+    return failure();
+  }
+
+  return success();
+}
 
 template <typename... ParentOpTypes> struct HasSomeParent {
   static LogicalResult verifyTrait(Operation *op) {
