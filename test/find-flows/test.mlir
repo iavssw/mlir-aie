@@ -18,6 +18,7 @@
 // CHECK:   AIE.packet_source<%[[T22]], DMA : 0>
 // CHECK:   AIE.packet_dest<%[[T23]], DMA : 1>
 // CHECK: }
+
 module {
 
   AIE.device("vck190")

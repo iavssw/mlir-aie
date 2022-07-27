@@ -4,7 +4,31 @@
         "amselArbiterIDmax": 5,
         "amselMselmin": 0,
         "amselMselmax": 3,
+        "DMABDABmin": 0,
+        "DMABDABmax": 1,
         "lockIDmin": 0,
-        "lockIDmax": 15
+        "lockIDmax": 15,
+        "UseLockValuemin": 0,
+        "UseLockValuemax": 2
+    },
+
+
+
+    "vck190_new": {
+        "amselArbiterID": {"min": 0, "max": 5}, 
+        "amselMsel": {"min": 0, "max": 3}, 
+        "DMABDAB": {"min": 0, "max": 1}, 
+        "lockID": {"min": 0, "max": 15}, 
+        "UseLockValue": {"min": 0, "max": 2}, 
+        
+        "SwitchBoxSourceChannels": {
+            "Core": 2, 
+            "DMA": 2,
+            "FIFO": 2,
+            "North": 6,
+            "West": 4,
+            "South": 4,
+            "East": 4
+        }
     }
 } 

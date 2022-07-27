@@ -229,7 +229,14 @@ public:
     // }
     //  = Optional.getValue();
 
-    // amselArbiterIDmin
+    // amselArbiterID min
+    auto OperationObj = deviceObj->getObject("amselArbiterID");
+    if (!deviceObj)
+      return "amselArbiterID";
+    auto OptionalAmselArbiterIDmin = deviceObj->getInteger("min");
+    if (!OptionalAmselArbiterIDmin.hasValue())
+      return "amselArbiterID";
+
     auto OptionalAmselArbiterIDmin = deviceObj->getInteger("amselArbiterIDmin");
     if (!OptionalAmselArbiterIDmin.hasValue()) {
       llvm::errs() << "amselArbiterIDmin is not defined for: " << deviceName
@@ -620,21 +627,21 @@ LogicalResult xilinx::AIE::AMSelOp::verify() {
   // arbiterID
   if (amSelOp.arbiterID() < deviceSpec.getamselArbiterIDmin()) {
     amSelOp.emitError() << "arbiterID is smaller than the minimum value of '"
-                       << deviceSpec.getamselArbiterIDmin() << "'\n";
+                        << deviceSpec.getamselArbiterIDmin() << "'\n";
     return failure();
   } else if (amSelOp.arbiterID() > deviceSpec.getamselArbiterIDmax()) {
     amSelOp.emitError() << "arbiterID is larger than the maximum value of '"
-                       << deviceSpec.getamselArbiterIDmax() << "'\n";
+                        << deviceSpec.getamselArbiterIDmax() << "'\n";
     return failure();
   }
   // msel
   if (amSelOp.msel() < deviceSpec.getamselMselmin()) {
     amSelOp.emitError() << "msel is smaller than the minimum value of '"
-                       << deviceSpec.getamselMselmin() << "'\n";
+                        << deviceSpec.getamselMselmin() << "'\n";
     return failure();
   } else if (amSelOp.msel() > deviceSpec.getamselMselmax()) {
     amSelOp.emitError() << "msel is larger than the maximum value of '"
-                       << deviceSpec.getamselMselmax() << "'\n";
+                        << deviceSpec.getamselMselmax() << "'\n";
     return failure();
   }
 
