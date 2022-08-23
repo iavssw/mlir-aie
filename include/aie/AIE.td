@@ -68,7 +68,6 @@ def ObjectFifoPort: I32EnumAttr<"ObjectFifoPort", "Ports of an object FIFO",
   let cppNamespace = "xilinx::AIE";
 }
 
-
 class AIE_Op<string mnemonic, list<Trait> traits = []> :
     Op<AIE_Dialect, mnemonic, traits>;
 
@@ -91,6 +90,26 @@ def AnyScalar : TypeConstraint<Or<[Index.predicate,
                                    AnySignlessInteger.predicate,
                                    AnyFloat.predicate]>,
                                   "scalar">;
+
+def AIE_DeviceOp: AIE_Op<"device", []> {
+  let summary = "Define device";
+  let description = [{
+    This operation defines the device used. From this definition, device specific 
+    variables are read from the JSON file located in the include directory. These
+    variables are verified for each operation that uses the variable to ensure 
+    correct operation. 
+
+    Example:
+    ```
+      AIE.device("vck190")
+    ```
+  }];
+  let arguments = (ins StrAttr:$deviceName);
+  let assemblyFormat = [{
+    `(` $deviceName `)` attr-dict
+  }];
+  let hasVerifier = 1;
+}
 
 def AIE_TileOp: AIE_Op<"tile", [FlowEndPoint]>, Results<(outs Index:$result)> {
   let arguments = (

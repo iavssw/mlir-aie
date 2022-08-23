@@ -19,6 +19,9 @@
 // CHECK:   AIE.packet_dest<%[[T23]], DMA : 1>
 // CHECK: }
 module {
+
+  AIE.device("vck190_new")
+
   %tile0 = AIE.tile(2, 3)
   %tile1 = AIE.tile(2, 2)
 

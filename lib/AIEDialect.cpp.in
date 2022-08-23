@@ -13,9 +13,12 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/FoldInterfaces.h"
+#include "mlir/Support/FileUtilities.h"
 #include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 using namespace mlir;
 
@@ -422,6 +425,140 @@ LogicalResult xilinx::AIE::ObjectFifoRegisterProcessOp::verify() {
           "must be of equal length, or longest length of one equal to process "
           "length of the other");
   }
+
+  return success();
+}
+
+class deviceSpecification {
+  bool initialized = false;
+  uint32_t amselArbiterIDmin;
+  uint32_t amselArbiterIDmax;
+  uint32_t amselMselmin;
+  uint32_t amselMselmax;
+  uint32_t lockIDmin;
+  uint32_t lockIDmax;
+
+public:
+  bool isInitialized() { return initialized; }
+
+  // llvm::Optional<std::string> readObjMinMax(std::string ObjName) {
+  //   auto amselArbiterID = deviceObj->getObject("amselArbiterID");
+  //   if (!deviceObj)
+  //     return "amselArbiterID not defined" + deviceName + "\n";
+  //   auto OptionalAmselArbiterIDmin = amselArbiterID->getInteger("min");
+  //   if (!OptionalAmselArbiterIDmin.hasValue())
+  //     return "amselArbiterID min not defined" + deviceName + "\n";
+  //   auto OptionalAmselArbiterIDmax = amselArbiterID->getInteger("max");
+  //   if (!OptionalAmselArbiterIDmax.hasValue())
+  //     return "amselArbiterID max not defined for " + deviceName + "\n";
+  //   if (OptionalAmselArbiterIDmin.getValue() < 0)
+  //     return "amselArbiterID min is not a positive integer\n";
+  //   if (OptionalAmselArbiterIDmax.getValue() < 0)
+  //     return "amselArbiterID max is not a positive integer\n";
+  // }
+
+  std::string initializeDevice(llvm::StringRef deviceName) {
+    // read device profile located in ${DEVICEJSON} configured by CMAKE during
+    // build time
+    std::string deviceNameString = (std::string)deviceName;
+    std::string errorMessage;
+    auto fileJson = mlir::openInputFile("${DEVICEJSON}", &errorMessage);
+    if (!fileJson) {
+      return errorMessage;
+    }
+    auto fileRaw = llvm::json::parse(fileJson->getBuffer());
+    if (!fileRaw) {
+      return "failed to parse the device spec json file\n";
+    }
+    auto fileObj = fileRaw.get().getAsObject();
+    if (!fileObj) {
+      return "failed to get object\n";
+    }
+    auto deviceObj = fileObj->getObject(deviceNameString);
+    if (!deviceObj) {
+      return "failed to find device object\n";
+    }
+
+    // amselArbiterID
+    auto amselArbiterID = deviceObj->getObject("amselArbiterID");
+    if (!deviceObj)
+      return "amselArbiterID not defined" + deviceNameString + "\n";
+    auto OptionalAmselArbiterIDmin = amselArbiterID->getInteger("min");
+    if (!OptionalAmselArbiterIDmin.hasValue())
+      return "amselArbiterID min not defined" + deviceNameString + "\n";
+    auto OptionalAmselArbiterIDmax = amselArbiterID->getInteger("max");
+    if (!OptionalAmselArbiterIDmax.hasValue())
+      return "amselArbiterID max not defined for " + deviceNameString + "\n";
+    if (OptionalAmselArbiterIDmin.getValue() < 0)
+      return "amselArbiterID min is not a positive integer\n";
+    if (OptionalAmselArbiterIDmax.getValue() < 0)
+      return "amselArbiterID max is not a positive integer\n";
+
+    amselArbiterIDmin = OptionalAmselArbiterIDmin.getValue();
+    amselArbiterIDmax = OptionalAmselArbiterIDmax.getValue();
+
+    llvm::errs() << "testing\n";
+    llvm::errs() << amselArbiterIDmin << "\n";
+    llvm::errs() << amselArbiterIDmax << "\n";
+
+    initialized = true;
+    return "true";
+  }
+
+  uint32_t getamselArbiterIDmin() { return amselArbiterIDmin; };
+  uint32_t getamselArbiterIDmax() { return amselArbiterIDmax; };
+  uint32_t getamselMselmin() { return amselMselmin; };
+  uint32_t getamselMselmax() { return amselMselmax; };
+  uint32_t getLockIDmin() { return lockIDmin; }
+  uint32_t getLockIDmax() { return lockIDmax; }
+};
+deviceSpecification deviceSpec;
+
+LogicalResult xilinx::AIE::DeviceOp::verify() {
+
+  // check that the DeviceOp is in the root module region.
+  Operation *m = getOperation()->getParentOp();
+  if (!llvm::isa<ModuleOp>(m)) {
+    llvm::dbgs() << "DeviceOp not in defined in the root nested region\n";
+    return failure();
+  }
+
+  // DeviceOp should only be defined once and be the first operation in the
+  // root module region. DeviceOp inside recursive nested regions are not
+  // checked as this is check in the previous if statement.
+  bool found = false;
+  bool firstOp = false;
+  for (Region &region : m->getRegions()) {
+    for (Block &block : region.getBlocks()) {
+      for (Operation &op : block.getOperations()) {
+        if (llvm::isa<xilinx::AIE::DeviceOp>(op)) {
+          if (found) {
+            llvm::dbgs() << "DeviceOp can only be defined once\n";
+            return failure();
+          }
+          if (firstOp) {
+            llvm::dbgs() << "DeviceOp is not the first operation\n";
+            return failure();
+          }
+          found = true;
+        }
+        if (!firstOp)
+          firstOp = true;
+      }
+    }
+  }
+
+  // get device name
+  xilinx::AIE::DeviceOp deviceOp =
+      dyn_cast<xilinx::AIE::DeviceOp>(getOperation());
+
+  deviceSpec.initializeDevice(deviceOp.deviceName());
+
+  // if (!deviceSpec.initializeDevice(deviceOp.deviceName())) {
+  //   llvm::dbgs() << "failed to initialize device specifications, update "
+  //                   "include/devices.json\n";
+  //   return failure();
+  // }
 
   return success();
 }
@@ -869,7 +1006,7 @@ namespace AIE {
 //   odsState.addTypes(resultType0);
 // }
 
-//#include "ATenOpInterfaces.cpp.inc"
+// #include "ATenOpInterfaces.cpp.inc"
 
 int SwitchboxOp::getNumSourceConnections(WireBundle bundle) {
   if (getTileOp().isShimTile())
