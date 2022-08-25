@@ -431,8 +431,8 @@ LogicalResult xilinx::AIE::ObjectFifoRegisterProcessOp::verify() {
 
 class deviceSpecification {
   bool initialized = false;
-  uint32_t amselArbiterIDmin;
-  uint32_t amselArbiterIDmax;
+  uint32_t amselArbiterIDmin = 69;
+  uint32_t amselArbiterIDmax = 69;
   uint32_t amselMselmin;
   uint32_t amselMselmax;
   uint32_t lockIDmin;
@@ -441,21 +441,28 @@ class deviceSpecification {
 public:
   bool isInitialized() { return initialized; }
 
-  // llvm::Optional<std::string> readObjMinMax(std::string ObjName) {
-  //   auto amselArbiterID = deviceObj->getObject("amselArbiterID");
-  //   if (!deviceObj)
-  //     return "amselArbiterID not defined" + deviceName + "\n";
-  //   auto OptionalAmselArbiterIDmin = amselArbiterID->getInteger("min");
-  //   if (!OptionalAmselArbiterIDmin.hasValue())
-  //     return "amselArbiterID min not defined" + deviceName + "\n";
-  //   auto OptionalAmselArbiterIDmax = amselArbiterID->getInteger("max");
-  //   if (!OptionalAmselArbiterIDmax.hasValue())
-  //     return "amselArbiterID max not defined for " + deviceName + "\n";
-  //   if (OptionalAmselArbiterIDmin.getValue() < 0)
-  //     return "amselArbiterID min is not a positive integer\n";
-  //   if (OptionalAmselArbiterIDmax.getValue() < 0)
-  //     return "amselArbiterID max is not a positive integer\n";
-  // }
+  llvm::Optional<std::string> readObjMinMax(llvm::json::Object *deviceObj,
+                                            std::string deviceName,
+                                            std::string variableName) {
+    auto variableObject = deviceObj->getObject(variableName);
+    if (!variableObject)
+      return variableName + " not defined for " + deviceName + "\n";
+    auto OptionalVariableNameMin = variableObject->getInteger("min");
+    if (!OptionalVariableNameMin.hasValue())
+      return variableName + " min not defined for " + deviceName + "\n";
+    auto OptionalVariableNameMax = variableObject->getInteger("max");
+    if (!OptionalVariableNameMax.hasValue())
+      return variableName + " max not defined for " + deviceName + "\n";
+    if (OptionalVariableNameMin.getValue() < 0)
+      return variableName + " min is not a positive integer\n";
+    if (OptionalVariableNameMax.getValue() < 0)
+      return variableName + " max is not a positive integer\n";
+
+    amselArbiterIDmin = OptionalVariableNameMin.getValue();
+    amselArbiterIDmax = OptionalVariableNameMax.getValue();
+
+    return None;
+  }
 
   std::string initializeDevice(llvm::StringRef deviceName) {
     // read device profile located in ${DEVICEJSON} configured by CMAKE during
@@ -479,25 +486,13 @@ public:
       return "failed to find device object\n";
     }
 
-    // amselArbiterID
-    auto amselArbiterID = deviceObj->getObject("amselArbiterID");
-    if (!deviceObj)
-      return "amselArbiterID not defined" + deviceNameString + "\n";
-    auto OptionalAmselArbiterIDmin = amselArbiterID->getInteger("min");
-    if (!OptionalAmselArbiterIDmin.hasValue())
-      return "amselArbiterID min not defined" + deviceNameString + "\n";
-    auto OptionalAmselArbiterIDmax = amselArbiterID->getInteger("max");
-    if (!OptionalAmselArbiterIDmax.hasValue())
-      return "amselArbiterID max not defined for " + deviceNameString + "\n";
-    if (OptionalAmselArbiterIDmin.getValue() < 0)
-      return "amselArbiterID min is not a positive integer\n";
-    if (OptionalAmselArbiterIDmax.getValue() < 0)
-      return "amselArbiterID max is not a positive integer\n";
-
-    amselArbiterIDmin = OptionalAmselArbiterIDmin.getValue();
-    amselArbiterIDmax = OptionalAmselArbiterIDmax.getValue();
+    auto errorMesssage =
+        readObjMinMax(deviceObj, deviceNameString, "amselArbiterID");
+    if (!errorMesssage.hasValue())
+      return errorMesssage.getValue();
 
     llvm::errs() << "testing\n";
+    llvm::errs() << error;
     llvm::errs() << amselArbiterIDmin << "\n";
     llvm::errs() << amselArbiterIDmax << "\n";
 
