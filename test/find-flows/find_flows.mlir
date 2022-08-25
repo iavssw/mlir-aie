@@ -20,7 +20,7 @@
 // CHECK: }
 module {
 
-  AIE.device("vck190_new")
+  AIE.device("vck190")
 
   %tile0 = AIE.tile(2, 3)
   %tile1 = AIE.tile(2, 2)

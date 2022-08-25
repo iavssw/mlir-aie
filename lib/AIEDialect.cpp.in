@@ -431,12 +431,19 @@ LogicalResult xilinx::AIE::ObjectFifoRegisterProcessOp::verify() {
 
 class deviceSpecification {
   bool initialized = false;
-  uint32_t amselArbiterIDmin = 69;
-  uint32_t amselArbiterIDmax = 69;
-  uint32_t amselMselmin;
-  uint32_t amselMselmax;
-  uint32_t lockIDmin;
-  uint32_t lockIDmax;
+  std::pair<int, int> passedMinMaxValue;
+
+  // initialized device variables
+  uint32_t amselArbiterIDMin;
+  uint32_t amselArbiterIDMax;
+  uint32_t amselMselMin;
+  uint32_t amselMselMax;
+  uint32_t DMABDABMin;
+  uint32_t DMABDABMax;
+  uint32_t lockIDMin;
+  uint32_t lockIDMax;
+  uint32_t useLockValueMin;
+  uint32_t useLockValueMax;
 
 public:
   bool isInitialized() { return initialized; }
@@ -458,54 +465,98 @@ public:
     if (OptionalVariableNameMax.getValue() < 0)
       return variableName + " max is not a positive integer\n";
 
-    amselArbiterIDmin = OptionalVariableNameMin.getValue();
-    amselArbiterIDmax = OptionalVariableNameMax.getValue();
+    // set the variable that temporarily stores the min max values
+    passedMinMaxValue = std::make_pair(OptionalVariableNameMin.getValue(),
+                                       OptionalVariableNameMax.getValue());
 
     return None;
   }
 
-  std::string initializeDevice(llvm::StringRef deviceName) {
+  llvm::Optional<std::string> initializeDevice(llvm::StringRef deviceName) {
     // read device profile located in ${DEVICEJSON} configured by CMAKE during
     // build time
-    std::string deviceNameString = (std::string)deviceName;
-    std::string errorMessage;
-    auto fileJson = mlir::openInputFile("${DEVICEJSON}", &errorMessage);
-    if (!fileJson) {
-      return errorMessage;
-    }
+    std::string fileErrorMessage;
+    auto fileJson = mlir::openInputFile("${DEVICEJSON}", &fileErrorMessage);
+    if (!fileJson)
+      return fileErrorMessage;
     auto fileRaw = llvm::json::parse(fileJson->getBuffer());
-    if (!fileRaw) {
-      return "failed to parse the device spec json file\n";
-    }
+    if (!fileRaw)
+      return (std::string) "failed to parse the device spec json file\n";
     auto fileObj = fileRaw.get().getAsObject();
-    if (!fileObj) {
-      return "failed to get object\n";
-    }
-    auto deviceObj = fileObj->getObject(deviceNameString);
-    if (!deviceObj) {
-      return "failed to find device object\n";
-    }
+    if (!fileObj)
+      return (std::string) "failed to get object\n";
+    auto deviceObj = fileObj->getObject(deviceName);
+    if (!deviceObj)
+      return (std::string) "failed to find device object\n";
 
-    auto errorMesssage =
-        readObjMinMax(deviceObj, deviceNameString, "amselArbiterID");
-    if (!errorMesssage.hasValue())
-      return errorMesssage.getValue();
+    // amselArbiterID initialize
+    llvm::Optional<std::string> readMinMaxErrorMessage;
+    readMinMaxErrorMessage =
+        readObjMinMax(deviceObj, (std::string)deviceName, "amselArbiterID");
+    if (readMinMaxErrorMessage.hasValue())
+      return readMinMaxErrorMessage.getValue();
+    amselArbiterIDMin = passedMinMaxValue.first;
+    amselArbiterIDMax = passedMinMaxValue.second;
+    // amselMsel initialize
+    readMinMaxErrorMessage =
+        readObjMinMax(deviceObj, (std::string)deviceName, "amselMsel");
+    if (readMinMaxErrorMessage.hasValue())
+      return readMinMaxErrorMessage.getValue();
+    amselMselMin = passedMinMaxValue.first;
+    amselMselMax = passedMinMaxValue.second;
+    // DMABDAB initialize
+    readMinMaxErrorMessage =
+        readObjMinMax(deviceObj, (std::string)deviceName, "DMABDAB");
+    if (readMinMaxErrorMessage.hasValue())
+      return readMinMaxErrorMessage.getValue();
+    DMABDABMin = passedMinMaxValue.first;
+    DMABDABMax = passedMinMaxValue.second;
+    // lockID initialize
+    readMinMaxErrorMessage =
+        readObjMinMax(deviceObj, (std::string)deviceName, "lockID");
+    if (readMinMaxErrorMessage.hasValue())
+      return readMinMaxErrorMessage.getValue();
+    lockIDMin = passedMinMaxValue.first;
+    lockIDMax = passedMinMaxValue.second;
+    // UseLockValue initialize
+    readMinMaxErrorMessage =
+        readObjMinMax(deviceObj, (std::string)deviceName, "useLockValue");
+    if (readMinMaxErrorMessage.hasValue())
+      return readMinMaxErrorMessage.getValue();
+    useLockValueMin = passedMinMaxValue.first;
+    useLockValueMax = passedMinMaxValue.second;
 
-    llvm::errs() << "testing\n";
-    llvm::errs() << error;
-    llvm::errs() << amselArbiterIDmin << "\n";
-    llvm::errs() << amselArbiterIDmax << "\n";
+    // testing
+    llvm::errs() << "amselArbiterID\n";
+    llvm::errs() << amselArbiterIDMin << "\n";
+    llvm::errs() << amselArbiterIDMax << "\n";
+    llvm::errs() << "amselMsel\n";
+    llvm::errs() << amselMselMin << "\n";
+    llvm::errs() << amselMselMax << "\n";
+    llvm::errs() << "DMABDAB\n";
+    llvm::errs() << DMABDABMin << "\n";
+    llvm::errs() << DMABDABMax << "\n";
+    llvm::errs() << "lockID\n";
+    llvm::errs() << lockIDMin << "\n";
+    llvm::errs() << lockIDMax << "\n";
+    llvm::errs() << "UseLockValue\n";
+    llvm::errs() << useLockValueMin << "\n";
+    llvm::errs() << useLockValueMax << "\n";
 
     initialized = true;
-    return "true";
+    return None;
   }
 
-  uint32_t getamselArbiterIDmin() { return amselArbiterIDmin; };
-  uint32_t getamselArbiterIDmax() { return amselArbiterIDmax; };
-  uint32_t getamselMselmin() { return amselMselmin; };
-  uint32_t getamselMselmax() { return amselMselmax; };
-  uint32_t getLockIDmin() { return lockIDmin; }
-  uint32_t getLockIDmax() { return lockIDmax; }
+  uint32_t getAmselArbiterIDMin() { return amselArbiterIDMin; };
+  uint32_t getAmselArbiterIDMax() { return amselArbiterIDMax; };
+  uint32_t getAmselMselMin() { return amselMselMin; };
+  uint32_t getAmselMselMax() { return amselMselMax; };
+  uint32_t getDMABDABMin() { return DMABDABMin; };
+  uint32_t getDMABDABMax() { return DMABDABMax; };
+  uint32_t getLockIDMin() { return lockIDMin; }
+  uint32_t getLockIDMax() { return lockIDMax; }
+  uint32_t getUseLockValueMin() { return useLockValueMin; }
+  uint32_t getUseLockValueMax() { return useLockValueMax; }
 };
 deviceSpecification deviceSpec;
 
@@ -547,13 +598,11 @@ LogicalResult xilinx::AIE::DeviceOp::verify() {
   xilinx::AIE::DeviceOp deviceOp =
       dyn_cast<xilinx::AIE::DeviceOp>(getOperation());
 
-  deviceSpec.initializeDevice(deviceOp.deviceName());
-
-  // if (!deviceSpec.initializeDevice(deviceOp.deviceName())) {
-  //   llvm::dbgs() << "failed to initialize device specifications, update "
-  //                   "include/devices.json\n";
-  //   return failure();
-  // }
+  auto errorMessage = deviceSpec.initializeDevice(deviceOp.deviceName());
+  if (errorMessage.hasValue()) {
+    llvm::errs() << errorMessage.getValue();
+    return failure();
+  }
 
   return success();
 }
