@@ -17,7 +17,7 @@ Set up a switchboxes to connect the AIE Tile DMA to the stream:
 	AIE.connect<"DMA" : 0, "North" : 1>
 }
 ```
-The AIE.connect function must exist inside an AIE.switchbox or AIE.shimmux operation. The numbers designate the source and destination channel number of the stream that we are trying to connect.
+The AIE.connect function must exist inside an AIE.switchbox or AIE.shim_mux operation. The numbers designate the source and destination channel number of the stream that we are trying to connect.
 
 The switchbox in tile (7,1) connects the Tile DMA channel 0 to North channel 1. If we define a switchbox in tile (7,2) as so:
  ```
@@ -42,11 +42,11 @@ as long as we don't have duplicate destinations.
 
 Shim tiles are special tiles at row 0 of the AIE array. There are two variants of Shim tiles, Shim NoC tile and Shim PL tile. You can connect to the device's PL through PLIO in any Shim tile. Shim DMAs are present in shim NoC tiles to transfer data between DDR and the AIE tile array. 
 
-Shim DMAs and some PLIO must be connected through a ShimMux before connecting to the rest of the array with a switchbox operation. You can configure a switch in the Shim NoC tile using 'shimmux' in addition to the switchbox operations:
+Shim DMAs and some PLIO must be connected through a ShimMux before connecting to the rest of the array with a switchbox operation. You can configure a switch in the Shim NoC tile using 'shim_mux' in addition to the switchbox operations:
 
  ```
 %t70 = AIE.tile(7, 0) // (Column, Row)
-%sw70 = AIE.shimmux(%t70) {
+%sw70 = AIE.shim_mux(%t70) {
 	AIE.connect<"North" : 2, "DMA" : 1>
 }
 ```
@@ -59,10 +59,10 @@ Then, we can connect the DMA to the rest of the array like so:
 }
 ```
 
-In order to read and write from the DDR using all available channels, a shimmux can be created like so:
+In order to read and write from the DDR using all available channels, a shim_mux can be created like so:
 
 ```
-%sw70 = AIE.shimmux(%t70) { 
+%sw70 = AIE.shim_mux(%t70) { 
   AIE.connect<"DMA" : 0, "North" : 3> \\ read
   AIE.connect<"DMA" : 1, "North" : 7> \\ read
   AIE.connect<"North" : 2, "DMA" : 0> \\ write
@@ -70,9 +70,9 @@ In order to read and write from the DDR using all available channels, a shimmux 
 }
 ```
 
-The shimmux always connects to a switchbox to its north, located within the same tile. The shimmux connects the Shim DMA channels to specific stream channels: i.e. exiting the array (write), streams 2 and 3 from the switchbox connect to Shim DMA channels, but entering the array (read), streams 3 and 7 to the switchbox connect from Shim DMA channels. The shimmux is then connected to the switchbox to route the streams to/from the array as shown above. 
+The shim_mux always connects to a switchbox to its north, located within the same tile. The shim_mux connects the Shim DMA channels to specific stream channels: i.e. exiting the array (write), streams 2 and 3 from the switchbox connect to Shim DMA channels, but entering the array (read), streams 3 and 7 to the switchbox connect from Shim DMA channels. The shim_mux is then connected to the switchbox to route the streams to/from the array as shown above. 
 
-It is important to note how the shimmux is modeled in MLIR compared to libXAIEV1. While the shimmux is modeled in MLIR matching the convention of a switchbox, due to the fact that it exists in the same tile as the switchbox, the channel directions are inverted (North to South) when lowered to libXAIEV1. 
+It is important to note how the shim_mux is modeled in MLIR compared to libXAIEV1. While the shim_mux is modeled in MLIR matching the convention of a switchbox, due to the fact that it exists in the same tile as the switchbox, the channel directions are inverted (North to South) when lowered to libXAIEV1. 
 
 ## AIE Flows
 
@@ -100,11 +100,11 @@ AIE.flow(%t73, "DMA" : 1, %t70, "PLIO" : 4)
 
 We support the visualization of routed modules in json format. 
 
-Here is an example of how users can route the `test/create-flows/broadcase.mlir` test, followed by converting the routed module into json format for visualization.
+Here is an example of how users can route the circuit-switched `test/create-flows/broadcast.mlir` test, followed by converting the routed module into json format for visualization.
 
 ```
 cd ${path-to-mlir-aie}/tools/aie-routing-command-line
-aie-opt --aie-create-pathfinder-flows --aie-find-flows ${path-to-mlir-aie}/test/create-flows/broadcast.mlir \
+aie-opt --aie-create-pathfinder-flows --aie-find-flows ../../test/create-flows/broadcast.mlir \
     | aie-translate --aie-flows-to-json > example.json
 python3 visualize.py -j example.json
 ```
@@ -166,3 +166,25 @@ Number on connection indicates the traffic in current direction.
 Asterisks indicate the tiles in use.
 
 For details on the usage of `visualize.py` please check out `python3 visualize.py --help`.
+
+
+Similarly, to visualize a packet-switched example,  
+
+```
+cd ${path-to-mlir-aie}/tools/aie-routing-command-line
+aie-opt --aie-create-pathfinder-flows --aie-find-flows ../../test/create-packet-flows/test_create_packet_flows6.mlir \
+    | aie-translate --aie-flows-to-json > example.json
+python3 visualize.py -j example.json
+```
+
+
+## Benckmarking Routing
+
+A python script is provided to measure the wall-clock time and the length of paths routed. Simply run 
+
+```
+python3  utils/router_performance.py test/create-flows/
+python3  utils/router_performance.py test/create-packet-flows/
+```
+
+and the generated `routing_performance_results.csv` files can be found under the corresponding folders.

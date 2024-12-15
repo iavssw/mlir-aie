@@ -6,7 +6,7 @@ Achieving high performance with the AIEngine architecture typically requires exe
 
 A typical starting point for automatic vectorization is to consider Affine looped programs. [Example](https://github.com/Xilinx/mlir-aie/tree/main/test/aievec/pointwise_mult_f32.mlir)
 ```
-func @pointwise_mult (%A: memref<2048xf32>, %B: memref<2048xf32>, %C: memref<2048xf32>) {
+func.func @pointwise_mult (%A: memref<2048xf32>, %B: memref<2048xf32>, %C: memref<2048xf32>) {
     affine.for %arg0 = 0 to 2048 {
        %a = affine.load %A[%arg0] : memref<2048xf32>
        %b = affine.load %B[%arg0] : memref<2048xf32>
@@ -26,7 +26,7 @@ The ["Affine Super-Vectorize" pass](https://mlir.llvm.org/docs/Passes/#-affine-s
 aie-opt -affine-super-vectorize="virtual-vector-size=8 vectorize-reductions" < pointwise_mult_f32.mlir
 ```
 ```
-  func @pointwise_mult(%arg0: memref<2048xf32>, %arg1: memref<2048xf32>, %arg2: memref<2048xf32>) {
+  func.func @pointwise_mult(%arg0: memref<2048xf32>, %arg1: memref<2048xf32>, %arg2: memref<2048xf32>) {
     affine.for %arg3 = 0 to 2048 step 8 {
       %cst = arith.constant 0.000000e+00 : f32
       %0 = vector.transfer_read %arg0[%arg3], %cst : memref<2048xf32>, vector<8xf32>
@@ -49,7 +49,7 @@ The ['AIE Vectorize' pass](https://xilinx.github.io/mlir-aie/AIEVecPasses.html) 
 aie-opt -affine-super-vectorize="virtual-vector-size=8 vectorize-reductions" --aie-vectorize < pointwise_mult_f32.mlir
 ```
 ```
-  func @pointwise_mult(%arg0: memref<2048xf32>, %arg1: memref<2048xf32>, %arg2: memref<2048xf32>) {
+  func.func @pointwise_mult(%arg0: memref<2048xf32>, %arg1: memref<2048xf32>, %arg2: memref<2048xf32>) {
     %c8 = arith.constant 8 : index
     %c2048 = arith.constant 2048 : index
     %c0 = arith.constant 0 : index
@@ -57,7 +57,7 @@ aie-opt -affine-super-vectorize="virtual-vector-size=8 vectorize-reductions" --a
       %0 = aievec.upd %arg0[%arg3] {index = 0 : i8, offset = 0 : si32} : memref<2048xf32>, vector<8xf32>
       %1 = aievec.upd %arg1[%arg3] {index = 0 : i8, offset = 0 : si32} : memref<2048xf32>, vector<8xf32>
       %2 = aievec.concat %0, %0 : vector<8xf32>, vector<16xf32>
-      %3 = aievec.mul %2, %1 {xoffsets = "0x76543210", xstart = "0", zoffsets = "0x76543210", zstart = "0"} : vector<16xf32>, vector<8xf32>, !aievec.acc<8xf32>
+      %3 = aievec_aie1.mul %2, %1 {xoffsets = "0x76543210", xstart = "0", zoffsets = "0x76543210", zstart = "0"} : vector<16xf32>, vector<8xf32>, !aievec.acc<8xf32>
       %4 = aievec.srs %3 {shift = 0 : i8} : !aievec.acc<8xf32>, vector<8xf32>
       vector.transfer_write %4, %arg2[%arg3] {in_bounds = [true]} : vector<8xf32>, memref<2048xf32>
     }
@@ -95,7 +95,7 @@ The AIEngine architecture supports a number of different datatypes, typically su
 aie-opt -affine-super-vectorize="virtual-vector-size=16" --aie-vectorize < pointwise_mult_i16.mlir
 ```
 ```
-func @pointwise_mult (%A: memref<2048xi16>, %B: memref<2048xi16>, %C: memref<2048xi16>) {
+func.func @pointwise_mult (%A: memref<2048xi16>, %B: memref<2048xi16>, %C: memref<2048xi16>) {
     affine.for %arg0 = 0 to 2048 {
        %a = affine.load %A[%arg0] : memref<2048xi16>
        %b = affine.load %B[%arg0] : memref<2048xi16>
@@ -107,14 +107,14 @@ func @pointwise_mult (%A: memref<2048xi16>, %B: memref<2048xi16>, %C: memref<204
 ```
 Results in:
 ```
-  func @pointwise_mult(%arg0: memref<2048xi16>, %arg1: memref<2048xi16>, %arg2: memref<2048xi16>) {
+  func.func @pointwise_mult(%arg0: memref<2048xi16>, %arg1: memref<2048xi16>, %arg2: memref<2048xi16>) {
     %c0 = arith.constant 0 : index
     %c2048 = arith.constant 2048 : index
     %c16 = arith.constant 16 : index
     scf.for %arg3 = %c0 to %c2048 step %c16 {
       %0 = aievec.upd %arg0[%arg3] {index = 0 : i8, offset = 0 : si32} : memref<2048xi16>, vector<16xi16>
       %1 = aievec.upd %arg1[%arg3] {index = 0 : i8, offset = 0 : si32} : memref<2048xi16>, vector<16xi16>
-      %2 = aievec.mul %0, %1 : vector<16xi16>, vector<16xi16>, !aievec.acc<16xi48>
+      %2 = aievec_aie1.mul %0, %1 : vector<16xi16>, vector<16xi16>, !aievec.acc<16xi48>
       %3 = aievec.srs %2 {shift = 0 : i8} : !aievec.acc<16xi48>, vector<16xi16>
       vector.transfer_write %3, %arg2[%arg3] {in_bounds = [true]} : vector<16xi16>, memref<2048xi16>
     }
@@ -130,7 +130,7 @@ More complex algorithms with multiple loops can be more challenging to vectorize
 aie-opt --affine-loop-unroll="unroll-full unroll-full-threshold=3" --canonicalize -affine-super-vectorize="virtual-vector-size=8" --aie-vectorize < conv2d_i32.mlir
 ```
 ```
-  func @conv2d(%arg0: memref<2048x2048xi32>, %arg1: memref<9xi32>, %arg2: memref<2046x2046xi32>) {
+  func.func @conv2d(%arg0: memref<2048x2048xi32>, %arg1: memref<9xi32>, %arg2: memref<2046x2046xi32>) {
     %c8 = arith.constant 8 : index
     %c0 = arith.constant 0 : index
     %0 = aievec.upd %arg1[%c0] {index = 0 : i8, offset = 0 : si32} : memref<9xi32>, vector<8xi32>
@@ -150,22 +150,22 @@ aie-opt --affine-loop-unroll="unroll-full unroll-full-threshold=3" --canonicaliz
         %4 = aievec.upd %arg2[%arg3, %arg4] {index = 0 : i8, offset = 0 : si32} : memref<2046x2046xi32>, vector<8xi32>
         %5 = aievec.upd %arg0[%arg3, %arg4] {index = 0 : i8, offset = 0 : si32} : memref<2048x2048xi32>, vector<16xi32>
         %6 = aievec.ups %4 {shift = 0 : i8} : vector<8xi32>, !aievec.acc<8xi80>
-        %7 = aievec.mac %5, %0, %6 {xoffsets = "0x76543210", xstart = "0", zoffsets = "0x00000000", zstart = "0"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
+        %7 = aievec_aie1.mac %5, %0, %6 {xoffsets = "0x76543210", xstart = "0", zoffsets = "0x00000000", zstart = "0"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
         %c1_5 = arith.constant 1 : index
         %8 = arith.addi %arg4, %c1_5 : index
         %9 = aievec.upd %arg0[%arg3, %8], %5 {index = 1 : i8, offset = 224 : si32} : memref<2048x2048xi32>, vector<16xi32>
-        %10 = aievec.mac %9, %0, %7 {xoffsets = "0x76543210", xstart = "1", zoffsets = "0x00000000", zstart = "1"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
-        %11 = aievec.mac %9, %0, %10 {xoffsets = "0x76543210", xstart = "2", zoffsets = "0x00000000", zstart = "2"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
+        %10 = aievec_aie1.mac %9, %0, %7 {xoffsets = "0x76543210", xstart = "1", zoffsets = "0x00000000", zstart = "1"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
+        %11 = aievec_aie1.mac %9, %0, %10 {xoffsets = "0x76543210", xstart = "2", zoffsets = "0x00000000", zstart = "2"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
         %12 = aievec.upd %arg0[%2, %arg4] {index = 0 : i8, offset = 0 : si32} : memref<2048x2048xi32>, vector<16xi32>
-        %13 = aievec.mac %12, %0, %11 {xoffsets = "0x76543210", xstart = "0", zoffsets = "0x00000000", zstart = "3"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
+        %13 = aievec_aie1.mac %12, %0, %11 {xoffsets = "0x76543210", xstart = "0", zoffsets = "0x00000000", zstart = "3"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
         %14 = aievec.upd %arg0[%2, %8], %12 {index = 1 : i8, offset = 224 : si32} : memref<2048x2048xi32>, vector<16xi32>
-        %15 = aievec.mac %14, %0, %13 {xoffsets = "0x76543210", xstart = "1", zoffsets = "0x00000000", zstart = "4"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
-        %16 = aievec.mac %14, %0, %15 {xoffsets = "0x76543210", xstart = "2", zoffsets = "0x00000000", zstart = "5"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
+        %15 = aievec_aie1.mac %14, %0, %13 {xoffsets = "0x76543210", xstart = "1", zoffsets = "0x00000000", zstart = "4"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
+        %16 = aievec_aie1.mac %14, %0, %15 {xoffsets = "0x76543210", xstart = "2", zoffsets = "0x00000000", zstart = "5"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
         %17 = aievec.upd %arg0[%3, %arg4] {index = 0 : i8, offset = 0 : si32} : memref<2048x2048xi32>, vector<16xi32>
-        %18 = aievec.mac %17, %0, %16 {xoffsets = "0x76543210", xstart = "0", zoffsets = "0x00000000", zstart = "6"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
+        %18 = aievec_aie1.mac %17, %0, %16 {xoffsets = "0x76543210", xstart = "0", zoffsets = "0x00000000", zstart = "6"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
         %19 = aievec.upd %arg0[%3, %8], %17 {index = 1 : i8, offset = 224 : si32} : memref<2048x2048xi32>, vector<16xi32>
-        %20 = aievec.mac %19, %0, %18 {xoffsets = "0x76543210", xstart = "1", zoffsets = "0x00000000", zstart = "7"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
-        %21 = aievec.mac %19, %1, %20 {xoffsets = "0x76543210", xstart = "2", zoffsets = "0x00000000", zstart = "0"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
+        %20 = aievec_aie1.mac %19, %0, %18 {xoffsets = "0x76543210", xstart = "1", zoffsets = "0x00000000", zstart = "7"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
+        %21 = aievec_aie1.mac %19, %1, %20 {xoffsets = "0x76543210", xstart = "2", zoffsets = "0x00000000", zstart = "0"} : vector<16xi32>, vector<8xi32>, !aievec.acc<8xi80>
         %22 = aievec.srs %21 {shift = 0 : i8} : !aievec.acc<8xi80>, vector<8xi32>
         vector.transfer_write %22, %arg2[%arg3, %arg4] {in_bounds = [true]} : vector<8xi32>, memref<2046x2046xi32>
       }
@@ -197,7 +197,7 @@ void conv2d(int img_in[17][272], int kernel_coeff[3][3], int img_out[16][256]) {
 
 Resulting in
 ```
-  func @conv2d(%arg0: memref<?x272xi32>, %arg1: memref<?x3xi32>, %arg2: memref<?x256xi32>) attributes {llvm.linkage = #llvm.linkage<external>} {
+  func.func @conv2d(%arg0: memref<?x272xi32>, %arg1: memref<?x3xi32>, %arg2: memref<?x256xi32>) attributes {llvm.linkage = #llvm.linkage<external>} {
     %c0_i32 = arith.constant 0 : i32
     affine.for %arg3 = 0 to 16 {
       affine.for %arg4 = 0 to 256 {
