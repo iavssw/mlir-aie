@@ -1,0 +1,104 @@
+##===- makefile-common ----------------------------------------------------===##
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+##===----------------------------------------------------------------------===##
+
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+current_dir := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+include ${current_dir}../../makefile-common
+
+devicename=npu2
+trace_size?=65536
+warmup?=1
+iters?=1
+verify?=true
+verify_samples?=1000
+min_gflops?=0
+verbosity?=0
+b_col_maj?=0
+c_col_maj?=0
+
+compute_type?=bf16
+cache_mode?=stream
+activation_input?=bf16
+cache_k?=${K}
+n_aie_cols?=8
+
+target_suffix?=${M}x${K}x${N}_${m_c}a${m_a}x${k}x${n}_${n_aie_cols}c_${compute_type}_${cache_mode}
+xclbin_target?=build/final_${target_suffix}.xclbin
+insts_target?=build/insts_${target_suffix}.bin
+trace_M?=512
+trace_K?=256
+trace_N?=256
+trace_m_c?=64
+trace_m_a?=32
+trace_k?=128
+trace_n?=64
+trace_n_aie_cols?=4
+trace_compute_type?=bf16
+trace_cache_mode?=stream
+trace_cache_k?=256
+trace_target_suffix?=${trace_M}x${trace_K}x${trace_N}_${trace_m_c}a${trace_m_a}x${trace_k}x${trace_n}_${trace_n_aie_cols}c_${trace_compute_type}_${trace_cache_mode}
+trace_xclbin_target?=build/trace_${trace_target_suffix}.xclbin
+trace_insts_target?=build/trace_insts_${trace_target_suffix}.bin
+
+aieargs+=--dev npu2 -M ${M} -K ${K} -N ${N} --m-c ${m_c} --m-a ${m_a} -k ${k} -n ${n} --n-aie-cols ${n_aie_cols} --compute-type ${compute_type} --cache-mode ${cache_mode} --activation-input ${activation_input} --cache-k ${cache_k}
+runargs+=--warmup ${warmup} --iters ${iters} --verify=${verify} --verify-samples ${verify_samples} --min-gflops ${min_gflops} --verbosity ${verbosity} --b_col_maj ${b_col_maj} --c_col_maj ${c_col_maj} --tile-m-c ${m_c} --tile-m-a ${m_a} --tile-k ${k} --tile-n ${n} --n-aie-cols ${n_aie_cols} --compute-type ${compute_type} --cache-mode ${cache_mode} --cache-k ${cache_k}
+trace_aieargs=--dev npu2 -M ${trace_M} -K ${trace_K} -N ${trace_N} --m-c ${trace_m_c} --m-a ${trace_m_a} -k ${trace_k} -n ${trace_n} --n-aie-cols ${trace_n_aie_cols} --compute-type ${trace_compute_type} --cache-mode ${trace_cache_mode} --activation-input bf16 --cache-k ${trace_cache_k}
+trace_runargs=--warmup ${warmup} --iters ${iters} --verify=${verify} --verify-samples ${verify_samples} --min-gflops ${min_gflops} --verbosity ${verbosity} --b_col_maj ${b_col_maj} --c_col_maj ${c_col_maj} --tile-m-c ${trace_m_c} --tile-m-a ${trace_m_a} --tile-k ${trace_k} --tile-n ${trace_n} --n-aie-cols ${trace_n_aie_cols} --compute-type ${trace_compute_type} --cache-mode ${trace_cache_mode} --cache-k ${trace_cache_k}
+
+.PHONY: all
+all: ${xclbin_target} ${targetname}.exe
+
+${xclbin_target} ${insts_target} &: ${srcdir}/${aie_py_src} ${srcdir}/q4ks.cc ${srcdir}/q4ks_bf16.cc ${srcdir}/../packing.py
+	mkdir -p $(@D)
+	python3 $< ${aieargs} --xclbin-path=${xclbin_target} --insts-path=${insts_target}
+
+${trace_xclbin_target} ${trace_insts_target} &: ${srcdir}/${aie_py_src} ${srcdir}/q4ks.cc ${srcdir}/q4ks_bf16.cc ${srcdir}/../packing.py
+	mkdir -p $(@D)
+	python3 $< ${trace_aieargs} --trace_size=${trace_size} --xclbin-path=${trace_xclbin_target} --insts-path=${trace_insts_target}
+
+${targetname}.exe: ${srcdir}/test.cpp ${srcdir}/../test.cpp ${srcdir}/../common.h ${srcdir}/../CMakeLists.txt
+	rm -rf _build
+	mkdir -p _build
+	cd _build && ${powershell} cmake -E env CXXFLAGS="-std=c++23 -ggdb" cmake `${getwslpath} ${srcdir}/..` -D CMAKE_C_COMPILER=${CC} -D CMAKE_CXX_COMPILER=${CXX} -DTARGET_NAME=${targetname} -Dsubdir=${subdir}
+	cd _build && ${powershell} cmake --build . --config Release
+ifeq "${powershell}" "powershell.exe"
+	cp _build/${targetname}.exe $@
+else
+	cp _build/${targetname} $@
+endif
+
+.PHONY: run
+run: ${targetname}.exe ${xclbin_target} ${insts_target}
+	${powershell} ./$< -x ${xclbin_target} -i ${insts_target} --kernel MLIR_AIE -M ${M} -K ${K} -N ${N} ${runargs}
+
+.PHONY: trace
+trace: ${targetname}.exe ${trace_xclbin_target} ${trace_insts_target}
+	${powershell} ./$< -x ${trace_xclbin_target} -i ${trace_insts_target} --kernel MLIR_AIE -M ${trace_M} -K ${trace_K} -N ${trace_N} ${trace_runargs} -t ${trace_size}
+	${srcdir}/../../../../python/utils/trace/parse.py --input trace.txt --mlir $(trace_xclbin_target:.xclbin=.prj)/input_with_addresses.mlir --output trace_q4ks_mm.json
+
+.PHONY: host-tests
+host-tests:
+	cd ${srcdir}/.. && python3 -m unittest discover -s whole_array/tests -p 'test_*.py' -v
+
+.PHONY: bench-sweep
+bench-sweep:
+	python3 ${srcdir}/benchmark_sweep.py --hardware -M ${M} -K ${K} -N ${N} --warmup ${warmup} --iters ${iters} --rounds 1
+
+.PHONY: perf-reference
+perf-reference:
+	python3 ${srcdir}/benchmark_sweep.py --hardware -M 512 -K 256 -N 512 --warmup 16 --iters 20 --rounds 3 --full-verify
+
+.PHONY: perf-large
+perf-large:
+	python3 ${srcdir}/benchmark_sweep.py --hardware -M 4096 -K 4096 -N 4096 --warmup 16 --iters 20 --rounds 3 --min-gflops 12000
+
+.PHONY: clean clean_trace
+clean: clean_trace
+	rm -rf build _build ${targetname}.exe
+
+clean_trace:
+	rm -rf tmpTrace parse*.json trace*json trace.txt

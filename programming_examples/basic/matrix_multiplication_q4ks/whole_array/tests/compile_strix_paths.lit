@@ -1,0 +1,9 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// REQUIRES: ryzen_ai_npu2, chess
+//
+// RUN: %python %S/../whole_array.py --dev npu2 -M 512 -K 256 -N 64 --m-c 64 --m-a 32 -k 128 -n 64 --n-aie-cols 1 --compute-type bf16 --cache-mode stream --cache-k 256 --xclbin-path=%t.1.xclbin --insts-path=%t.1.bin
+// RUN: %python %S/../whole_array.py --dev npu2 -M 512 -K 256 -N 128 --m-c 64 --m-a 32 -k 128 -n 64 --n-aie-cols 2 --compute-type bf16 --cache-mode stream --cache-k 256 --xclbin-path=%t.2.xclbin --insts-path=%t.2.bin
+// RUN: %python %S/../whole_array.py --dev npu2 -M 512 -K 256 -N 256 --m-c 64 --m-a 32 -k 128 -n 64 --n-aie-cols 4 --compute-type int8 --cache-mode stream --cache-k 256 --xclbin-path=%t.4.xclbin --insts-path=%t.4.bin
+// RUN: %python %S/../whole_array.py --dev npu2 -M 512 -K 256 -N 512 --m-c 64 --m-a 32 -k 128 -n 64 --n-aie-cols 8 --compute-type bfp16 --cache-mode memtile-weight --cache-k 256 --xclbin-path=%t.8.xclbin --insts-path=%t.8.bin
