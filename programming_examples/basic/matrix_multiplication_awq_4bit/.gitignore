@@ -1,0 +1,15 @@
+build/
+_build/
+*.exe
+*.xclbin
+*.bin
+*.prj/
+trace.txt
+trace*.json
+parse*.json
+tmpTrace/
+benchmark*.txt
+__pycache__/
+*.pyc
+*.orig
+*.rej

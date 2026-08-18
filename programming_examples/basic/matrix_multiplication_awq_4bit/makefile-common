@@ -1,0 +1,115 @@
+##===- makefile-common ----------------------------------------------------===##
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+##===----------------------------------------------------------------------===##
+
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+current_dir := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+include ${current_dir}../../makefile-common
+
+dtype_out?=bf16
+trace_size?=65536
+use_chess?=1
+devicename=npu2
+
+ifeq ($(dtype_out),bf16)
+  dtype_out_cpp=test_utils::bfloat16_t
+else ifeq ($(dtype_out),f32)
+  dtype_out_cpp=float
+else
+  $(error dtype_out must be bf16 or f32)
+endif
+
+trace_M?=512
+trace_K?=128
+trace_N?=64
+trace_m?=${m}
+trace_k?=${k}
+trace_n?=${n}
+trace_group_size?=${group_size}
+trace_n_aie_cols?=1
+
+target_suffix?=${M}x${K}x${N}_${m}x${k}x${n}_g${group_size}_${n_aie_cols}c_${dtype_out}
+trace_target_suffix?=${trace_M}x${trace_K}x${trace_N}_${trace_m}x${trace_k}x${trace_n}_g${trace_group_size}_${trace_n_aie_cols}c_${dtype_out}
+xclbin_target?=build/final_${target_suffix}.xclbin
+trace_xclbin_target?=build/trace_${trace_target_suffix}.xclbin
+insts_target?=build/insts_${target_suffix}.bin
+trace_insts_target?=build/trace_insts_${trace_target_suffix}.bin
+aie_py_src?=${targetname}.py
+
+warmup?=1
+iters?=1
+verify?=true
+verbosity?=1
+
+aieargs+=--dev npu2 -M $M -K $K -N $N --dtype_out ${dtype_out} --use-chess ${use_chess}
+runargs+=--warmup ${warmup} --iters ${iters} --verify=${verify} --verbosity ${verbosity} \
+  --tile-m $m --tile-k $k --tile-n $n --group-size ${group_size} --n-aie-cols ${n_aie_cols}
+trace_aieargs+=--dev npu2 -M ${trace_M} -K ${trace_K} -N ${trace_N} \
+  -m ${trace_m} -k ${trace_k} -n ${trace_n} --group-size ${trace_group_size} \
+  --n-aie-cols ${trace_n_aie_cols} --dtype_out ${dtype_out} --use-chess ${use_chess}
+trace_runargs+=--warmup ${warmup} --iters ${iters} --verify=${verify} --verbosity ${verbosity} \
+  --tile-m ${trace_m} --tile-k ${trace_k} --tile-n ${trace_n} \
+  --group-size ${trace_group_size} --n-aie-cols ${trace_n_aie_cols}
+
+.PHONY: all
+all: ${xclbin_target} ${targetname}.exe
+
+${xclbin_target} ${insts_target} &: ${srcdir}/${aie_py_src} ${srcdir}/awq_4bit.cc ${srcdir}/../packing.py
+	mkdir -p $(@D)
+	python3 $< ${aieargs} --xclbin-path=${xclbin_target} --insts-path=${insts_target}
+
+${trace_xclbin_target} ${trace_insts_target} &: ${srcdir}/${aie_py_src} ${srcdir}/awq_4bit.cc ${srcdir}/../packing.py
+	mkdir -p $(@D)
+	python3 $< ${trace_aieargs} --trace_size=${trace_size} --xclbin-path=${trace_xclbin_target} --insts-path=${trace_insts_target}
+
+${targetname}.exe: ${srcdir}/test.cpp ${srcdir}/../test.cpp ${srcdir}/../common.h ${srcdir}/../CMakeLists.txt
+	rm -rf _build
+	mkdir -p _build
+	cd _build && ${powershell} cmake -E env CXXFLAGS="-std=c++23 -ggdb -DDTYPE_OUT=${dtype_out_cpp}" \
+		cmake `${getwslpath} ${srcdir}/..` -D CMAKE_C_COMPILER=${CC} -D CMAKE_CXX_COMPILER=${CXX} -DTARGET_NAME=${targetname} -Dsubdir=${subdir}
+	cd _build && ${powershell} cmake --build . --config Release
+ifeq "${powershell}" "powershell.exe"
+	cp _build/${targetname}.exe $@
+else
+	cp _build/${targetname} $@
+endif
+
+.PHONY: run
+run: ${targetname}.exe ${xclbin_target} ${insts_target}
+	${powershell} ./$< -x ${xclbin_target} -i ${insts_target} --kernel MLIR_AIE -M $M -K $K -N $N ${runargs}
+
+.PHONY: trace
+trace: ${targetname}.exe ${trace_xclbin_target} ${trace_insts_target}
+	${powershell} ./$< -x ${trace_xclbin_target} -i ${trace_insts_target} --kernel MLIR_AIE \
+		-M ${trace_M} -K ${trace_K} -N ${trace_N} ${trace_runargs} -t ${trace_size}
+	${srcdir}/../../../../python/utils/trace/parse.py --input trace.txt --mlir $(trace_xclbin_target:.xclbin=.prj)/input_with_addresses.mlir --output trace_awq_mm.json
+
+.PHONY: parse_trace
+parse_trace:
+	${srcdir}/../../../../python/utils/trace/parse.py --input trace.txt --mlir $(trace_xclbin_target:.xclbin=.prj)/input_with_addresses.mlir --output trace_awq_mm.json
+
+.PHONY: host-tests
+host-tests:
+	cd ${srcdir}/.. && python3 -m unittest discover -s whole_array/tests -p 'test_*.py' -v
+
+.PHONY: perf-reference
+perf-reference:
+	python3 ${srcdir}/${aie_py_src} --dev npu2 -M 1024 -K 1024 -N 2048 -m 64 -k 128 -n 64 \
+		--group-size 128 --n-aie-cols 8 --dtype_out bf16 --use-chess 1 \
+		--warmup 16 --iters 20 --benchmark-repeats 3 --min-gflops 6840 --verify-mode sampled
+
+.PHONY: perf-large
+perf-large:
+	python3 ${srcdir}/${aie_py_src} --dev npu2 -M 4096 -K 4096 -N 4096 -m 64 -k 128 -n 64 \
+		--group-size 128 --n-aie-cols 8 --dtype_out bf16 --use-chess 1 \
+		--warmup 16 --iters 20 --benchmark-repeats 3 --verify-mode sampled
+
+.PHONY: clean clean_trace
+clean: clean_trace
+	rm -rf build _build ${targetname}.exe
+
+clean_trace:
+	rm -rf tmpTrace parse*.json trace*json trace.txt

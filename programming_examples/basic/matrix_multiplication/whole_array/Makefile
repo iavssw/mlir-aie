@@ -8,16 +8,16 @@ srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 subdir=whole_array
 targetname=whole_array
 
-M?=512
-K?=512
-N?=512
+M?=4096
+K?=4096
+N?=4096
 
-m?=32
-k?=32
-n?=32
+m?=64
+k?=64
+n?=64
 
-n_aie_cols?=4
-b_col_maj?=0
+n_aie_cols?=8
+b_col_maj?=1
 c_col_maj?=0
 use_scalar?=0
 

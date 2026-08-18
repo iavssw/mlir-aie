@@ -1,0 +1,13 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// REQUIRES: ryzen_ai_npu2, chess
+// REQUIRES: makefile_examples
+//
+// RUN: mkdir -p %t
+// RUN: cd %t
+// RUN: make -f %S/../Makefile
+// RUN: %run_on_npu2% make -f %S/../Makefile run | FileCheck %s
+// CHECK: Matrix 1024x1024x2048, tile 64x128x64, group 128, columns 8
+// CHECK: Sampled verification checked 1000 outputs
+// CHECK: PASS!

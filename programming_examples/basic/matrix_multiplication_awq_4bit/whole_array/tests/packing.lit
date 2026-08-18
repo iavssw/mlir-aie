@@ -1,0 +1,6 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// RUN: %python %S/test_packing.py 2>&1 | FileCheck %s
+// CHECK: Ran 7 tests
+// CHECK: OK
