@@ -21,17 +21,33 @@ The same whole-array graph exposes three Chess kernels:
 All paths produce BF16. The kernel receives an explicit A-subtile index,
 dequantizes B only for subtile zero, and has no mutable call counter.
 
-Native BFP16 has three accumulation modes:
+Native BFP16 has four user-facing accumulation modes:
 
 | mode | behavior |
 |---|---|
 | bf16 | accumulate a 64-K tile in `accfloat`, then write/read BF16 between K tiles |
 | fp32 | retain the whole output tile in local FP32 scratch and convert to BF16 only once |
 | cascade | split K over four AIE rows, pass `accfloat` values over cascade streams, retain the completed sum in FP32, then write BF16 |
+| cascade-hybrid | run two independent two-row K splits, keep fast BF16 local prefix partials, then reduce each final `accfloat` contribution over physical cascade and write BF16 once |
 
-The cascade specialization is intentionally limited to `k=64`. A `k=128`
-experiment fit data memory but overflowed AIE program memory for its three
-fully scheduled cascade roles, so validation rejects it before compilation.
+The full-FP32 `cascade` specialization is intentionally limited to `k=64`.
+A `k=128` experiment fit data memory but overflowed AIE program memory for
+its three fully scheduled cascade roles, so validation rejects it before
+compilation.
+
+`cascade-hybrid` is the performance-oriented compromise. Each column runs
+two independent two-row chains; the rows in a chain own even and odd K tiles
+for the same output tile. Prefix K tiles update a BF16 local partial, so those
+boundaries still round to BF16. The final K tile loads that partial into
+`accfloat`; the final matrix work and the bottom-to-top two-row reduction stay
+in `accfloat`, without a memory spill, before the top row performs one BF16
+store. It is therefore not full-K FP32.
+
+For the 4096-cubed candidate (`mC=256`, `mA=32`, `k=128`, `n=64`), every
+role object contains separate branch-free normal and final kernel symbols.
+This removes the costly runtime final-tile branch while retaining physical
+cascade edges. Dynamic worker loops keep the linked program-memory image at
+12,826 bytes, including the worker controller and fixed libraries.
 
 There are not separate BFP and BF16 matrix engines to run concurrently. Chess
 lowers both the native-BFP path and the BF16-emulation path to the same
@@ -42,8 +58,10 @@ to BFP moved both operands onto the block-load path and reduced throughput.
 Three cache modes are executable:
 
 - stream: compressed Q4 tiles use the baseline whole-array schedule.
-- l1-weight: labels the asymmetric-tile experiment; one dequantized B tile
-  is retained while all mC/mA A subtiles are processed.
+- l1-weight: retains one dequantized B tile while all mC/mA A subtiles are
+  processed. In `cascade-hybrid`, it streams one compressed full-K panel per
+  output pair through a single shim channel and demultiplexes the two parity
+  shards in the MemTile without hardware replay.
 - memtile-weight: uses an N-panel-outer schedule, loads one compressed
   full-K panel per column, and replays its K tiles with ObjectFifo.repeat_count.
   Hardware replay is bounded to the largest row-slab divisor no greater than
@@ -142,6 +160,14 @@ Host Q4_K preparation is model-load work and is excluded.
 | native BFP, local FP32 accumulation | 5.693 TOPS average | 0.01637 | 0.00991 |
 | native BFP, four-row cascade FP32 | 7.681 TOPS average | 0.01637 | 0.00991 |
 | native BFP, 256/32 x 64 x 64 reuse tile | 7.060 TOPS average | 0.01919 | 0.01381 |
+| native BFP, two-row cascade-hybrid, MemTile replay | 12.281 TOPS average | 0.01746 | 0.01140 |
+| native BFP, two-row cascade-hybrid, streamed panel | **12.623 TOPS average** | 0.01746 | 0.01140 |
+
+The streamed-panel hybrid result uses 16 warmups and 20 timed iterations after
+a reboot, passes sampled native-Q4_K verification, and keeps the last tile and
+two-row reduction in `accfloat`. Its maximum absolute error is 0.0585938 and
+its full run spans 12.014--12.948 TOPS. It improves on bounded MemTile replay,
+but it does not meet the 16-TOPS cascade research gate.
 
 The selected path was run for three rounds of 16 warmups plus 20 timed
 iterations. Round averages were 16.504, 16.472, and 16.190 TOPS; the complete
@@ -165,9 +191,10 @@ make perf-ceiling-3x
 sudo xrt-smi configure --pmode default
 ~~~
 
-Always record the reported power mode with a ceiling number. The table above
-intentionally contains only Default-mode measurements; Turbo requires an
-interactive administrator-authorized device-state change.
+Always record the reported power mode with a ceiling number. A reboot resets
+this device to Default. The table above intentionally contains only
+Default-mode measurements; Turbo requires an interactive
+administrator-authorized device-state change.
 
 A small full-verification run is:
 
@@ -203,11 +230,16 @@ The stable comparison targets use the exact configurations from the table:
 make perf-fp32
 make perf-cascade
 make perf-memtile
+make perf-cascade-hybrid
+make perf-cascade-hybrid-3x
 ~~~
 
 All retain BF16 host activations and BF16 output. `perf-fp32` keeps one local
 FP32 C tile across K; `perf-cascade` passes intermediate `accfloat` values
-between rows; `perf-memtile` exercises bounded compressed-panel replay.
+between rows; `perf-memtile` exercises bounded compressed-panel replay. The
+hybrid target uses the 256/32 x 128 x 64 two-row, streamed-panel design and
+fails if its average is below 16,000 GFLOP/s.
+`perf-cascade-hybrid-3x` applies three rounds of 16 warmups plus 20 timed iterations and gates the median round-average.
 
 Trace builds use a separate four-column diagnostic configuration because a
 spare shim column is required:
@@ -236,6 +268,7 @@ Hardware sweeps write ignored CSV/JSON tables:
 make bench-sweep
 make perf-reference
 make perf-large
+make perf-cascade-hybrid-3x
 ~~~
 
 perf-large applies the primary protocol: BF16 activation input, eight
@@ -247,5 +280,6 @@ to build/selected_default.json.
 
 The Make default is the verified native-BFP16/L1-weight candidate. The Python
 CLI keeps the conservative BF16 streaming defaults for small direct tests.
-Do not interpret compile-only success or capacity-model rows as a 12-TOPS
-measurement.
+Do not interpret compile-only success or capacity-model rows as a
+greater-than-16-TOPS measurement. The measured hybrid result is explicitly
+reported below that goal until a future design passes the gate.

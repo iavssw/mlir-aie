@@ -1,6 +1,7 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+from dataclasses import replace
 import sys
 import unittest
 from pathlib import Path
@@ -313,6 +314,63 @@ class PreparedLayoutTests(unittest.TestCase):
                 n_aie_cols=8,
                 compute_type="bfp16",
                 accumulation_mode="cascade",
+            )
+
+    def test_hybrid_cascade_memory_and_validation(self):
+        hybrid = Q4KSConfig(
+            M=2048,
+            K=4096,
+            N=512,
+            m_c=256,
+            m_a=32,
+            k=128,
+            n=64,
+            n_aie_cols=8,
+            compute_type="bfp16",
+            accumulation_mode="cascade-hybrid",
+            cache_mode="memtile-weight",
+            cache_k=4096,
+        )
+        self.assertEqual(hybrid.a_fifo_depth, 1)
+        self.assertLessEqual(hybrid.core_memory_bytes, 64 * 1024)
+        self.assertLessEqual(
+            sum(hybrid.memtile_components().values()), 512 * 1024
+        )
+        self.assertIn(
+            "BF16 local K/2 partial", hybrid.core_memory_components
+        )
+        l1_hybrid = replace(hybrid, cache_mode="l1-weight")
+        self.assertEqual(
+            l1_hybrid.memtile_components()[
+                "resident compressed-Q4_K panel"
+            ],
+            0,
+        )
+        self.assertEqual(
+            l1_hybrid.memtile_components()[
+                "streamed compressed-Q4_K panel"
+            ],
+            l1_hybrid.panel_bytes("q4"),
+        )
+        self.assertLessEqual(
+            sum(l1_hybrid.memtile_components().values()), 512 * 1024
+        )
+        with self.assertRaisesRegex(
+            ValueError, "requires l1-weight or memtile-weight"
+        ):
+            Q4KSConfig(
+                M=2048,
+                K=4096,
+                N=512,
+                m_c=256,
+                m_a=32,
+                k=128,
+                n=64,
+                n_aie_cols=8,
+                compute_type="bfp16",
+                accumulation_mode="cascade-hybrid",
+                cache_mode="stream",
+                cache_k=4096,
             )
 
 

@@ -121,7 +121,8 @@ int main(int argc, const char *argv[]) {
       "n-aie-cols", "NPU2 columns", cxxopts::value<int>()->default_value("8"))(
       "compute-type", "bf16, bfp16, or int8",
       cxxopts::value<std::string>()->default_value("bf16"))(
-      "accumulation-mode", "bf16 tile writeback, fp32 scratch, or cascade",
+      "accumulation-mode",
+      "bf16 tile writeback, fp32 scratch, cascade, or cascade-hybrid",
       cxxopts::value<std::string>()->default_value("bf16"))(
       "cache-mode", "stream, l1-weight, or memtile-weight",
       cxxopts::value<std::string>()->default_value("stream"))(
@@ -389,9 +390,10 @@ int main(int argc, const char *argv[]) {
     for (int sample = 0; sample < sample_count; ++sample) {
       const int row = sampled ? rows(rng) : sample / layout.N;
       const int col = sampled ? cols(rng) : sample % layout.N;
-      const float expected =
-          q4ks::reference_value(layout, inputs, decoded, row, col,
-                                layout.accumulation_mode == "bf16");
+      const float expected = q4ks::reference_value(
+          layout, inputs, decoded, row, col,
+          layout.accumulation_mode == "bf16" ||
+              layout.accumulation_mode == "cascade-hybrid");
       const float actual = q4ks::as_float(
           output[static_cast<std::size_t>(row) * layout.N + col]);
       const double difference = std::abs(actual - expected);

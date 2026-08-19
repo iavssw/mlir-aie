@@ -93,9 +93,15 @@ struct Layout {
   int a_depth() const {
     if (accumulation_mode == "cascade")
       return 2;
+    if (accumulation_mode == "cascade-hybrid")
+      return 1;
     return m_a >= 64 ? 1 : 2;
   }
   std::size_t core_memory_bytes() const {
+    if (accumulation_mode == "cascade-hybrid")
+      return static_cast<std::size_t>(m_a) * k * 2 + tile_bytes() +
+             static_cast<std::size_t>(k) * n * 9 / 8 +
+             static_cast<std::size_t>(m_c) * n * 2 + 0xD00 + 4 * 1024;
     const std::size_t a_fifo =
         static_cast<std::size_t>(a_depth()) * m_a * k * 2;
     const std::size_t b_fifo = tile_bytes();
@@ -122,6 +128,9 @@ struct Layout {
     std::size_t resident = 0;
     if (cache_mode == "memtile-weight")
       resident = static_cast<std::size_t>(cache_k / k) * tile_bytes();
+    if (accumulation_mode == "cascade-hybrid")
+      return resident + 2ULL * m_c * k * 2 +
+             static_cast<std::size_t>(m_c) * n * 2 + 32 * 1024;
     return resident + static_cast<std::size_t>(n_aie_rows) * m_c * n * 2 +
            2ULL * (static_cast<std::size_t>(m_a) * k * 2 + tile_bytes()) +
            32 * 1024;
@@ -150,9 +159,9 @@ struct Layout {
         compute_type != "int8")
       throw std::invalid_argument("compute type must be bf16, bfp16, or int8");
     if (accumulation_mode != "bf16" && accumulation_mode != "fp32" &&
-        accumulation_mode != "cascade")
+        accumulation_mode != "cascade" && accumulation_mode != "cascade-hybrid")
       throw std::invalid_argument(
-          "accumulation mode must be bf16, fp32, or cascade");
+          "accumulation mode must be bf16, fp32, cascade, or cascade-hybrid");
     if (accumulation_mode != "bf16" && compute_type != "bfp16")
       throw std::invalid_argument(
           "FP32 and cascade accumulation require bfp16 compute");
@@ -169,6 +178,24 @@ struct Layout {
       if (cache_mode != "stream" && cache_mode != "l1-weight")
         throw std::invalid_argument(
             "cascade accumulation supports stream or l1-weight");
+    }
+    if (accumulation_mode == "cascade-hybrid") {
+      const bool valid_tile =
+          (m_c == 128 && m_a == 32 && k == 64 && n == 128) ||
+          (m_c == 128 && m_a == 64 && k == 128 && n == 64) ||
+          (m_c == 256 && (m_a == 32 || m_a == 64) && k == 64 && n == 64) ||
+          (m_c == 256 && m_a == 32 && k == 128 && n == 64) ||
+          (m_c == 512 && (m_a == 32 || m_a == 64) && k == 64 && n == 32);
+      if (!valid_tile)
+        throw std::invalid_argument(
+            "cascade-hybrid tile must be 128x32x64x128, "
+            "128x64x128x64, 256x(32|64)x64x64, "
+            "256x32x128x64, or 512x(32|64)x64x32");
+      if (K % (2 * k))
+        throw std::invalid_argument("cascade-hybrid requires 2*k to divide K");
+      if (cache_mode != "l1-weight" && cache_mode != "memtile-weight")
+        throw std::invalid_argument(
+            "cascade-hybrid requires l1-weight or memtile-weight");
     }
     if (cache_mode != "stream" && cache_mode != "l1-weight" &&
         cache_mode != "memtile-weight")
@@ -402,11 +429,19 @@ prepare_weights(const Layout &layout, const std::vector<std::uint8_t> &native) {
   const int n_k_tiles = layout.K / layout.k;
   const int n_n_tiles = layout.N / layout.n;
   const int n_rounds = n_n_tiles / layout.n_aie_cols;
+  const int cascade_rows =
+      layout.accumulation_mode == "cascade-hybrid" ? 2 : n_aie_rows;
+  const int chunks_per_row = n_k_tiles / cascade_rows;
   std::size_t tile_index = 0;
   for (int col = 0; col < layout.n_aie_cols; ++col) {
     for (int n_round = 0; n_round < n_rounds; ++n_round) {
       const int nt = col + n_round * layout.n_aie_cols;
-      for (int kt = 0; kt < n_k_tiles; ++kt, ++tile_index) {
+      for (int stored_kt = 0; stored_kt < n_k_tiles;
+           ++stored_kt, ++tile_index) {
+        const int kt = layout.accumulation_mode == "cascade-hybrid"
+                           ? (stored_kt % chunks_per_row) * cascade_rows +
+                                 stored_kt / chunks_per_row
+                           : stored_kt;
         auto *tile = prepared.data() + tile_index * layout.tile_bytes();
         std::size_t cursor = 0;
         const int k0 = kt * layout.k;
@@ -481,67 +516,92 @@ inline void round_bfp16ebs8(const float input[8], float output[8]) {
   }
 }
 
+inline void reference_accumulate_tile(const Layout &layout,
+                                      const Inputs &inputs,
+                                      const Decoded &decoded, int row, int col,
+                                      int kt, float &accumulator) {
+  for (int group0 = kt; group0 < kt + layout.k; group0 += group_size) {
+    const auto parameter =
+        static_cast<std::size_t>(group0 / group_size) * layout.N + col;
+    const float ws = as_float(as_bf16(decoded.scales[parameter]));
+    const float wb = as_float(as_bf16(decoded.biases[parameter]));
+    if (layout.compute_type == "int8") {
+      float maximum = 0.0f;
+      for (int x = 0; x < group_size; ++x)
+        maximum = std::max(
+            maximum, std::abs(as_float(
+                         inputs.A[static_cast<std::size_t>(row) * layout.K +
+                                  group0 + x])));
+      const float quant_scale = maximum == 0.0f ? 1.0f : maximum / 127.0f;
+      const float stored_scale = as_float(as_bf16(quant_scale));
+      int dot = 0;
+      int sum = 0;
+      for (int x = 0; x < group_size; ++x) {
+        const float a = as_float(
+            inputs.A[static_cast<std::size_t>(row) * layout.K + group0 + x]);
+        int q = static_cast<int>(a / quant_scale + (a >= 0.0f ? 0.5f : -0.5f));
+        q = std::clamp(q, -127, 127);
+        sum += q;
+        dot += q *
+               decoded.q[static_cast<std::size_t>(group0 + x) * layout.N + col];
+      }
+      accumulator += stored_scale * (ws * dot - wb * sum);
+    } else if (layout.compute_type == "bfp16") {
+      for (int x = 0; x < group_size; x += 8) {
+        float activation[8], weights[8], rounded_a[8], rounded_b[8];
+        for (int lane = 0; lane < 8; ++lane) {
+          const int inner = group0 + x + lane;
+          activation[lane] = as_float(
+              inputs.A[static_cast<std::size_t>(row) * layout.K + inner]);
+          const auto q =
+              decoded.q[static_cast<std::size_t>(inner) * layout.N + col];
+          weights[lane] = as_float(as_bf16(static_cast<float>(q) * ws - wb));
+        }
+        round_bfp16ebs8(activation, rounded_a);
+        round_bfp16ebs8(weights, rounded_b);
+        for (int lane = 0; lane < 8; ++lane)
+          accumulator += rounded_a[lane] * rounded_b[lane];
+      }
+    } else {
+      for (int x = 0; x < group_size; ++x) {
+        const auto a =
+            inputs.A[static_cast<std::size_t>(row) * layout.K + group0 + x];
+        const auto q =
+            decoded.q[static_cast<std::size_t>(group0 + x) * layout.N + col];
+        const float weight = as_float(as_bf16(static_cast<float>(q) * ws - wb));
+        accumulator += as_float(a) * weight;
+      }
+    }
+  }
+}
+
 inline float reference_value(const Layout &layout, const Inputs &inputs,
                              const Decoded &decoded, int row, int col,
                              bool round_tile_partials = true) {
-  float accumulator = 0.0f;
-  for (int kt = 0; kt < layout.K; kt += layout.k) {
-    for (int group0 = kt; group0 < kt + layout.k; group0 += group_size) {
-      const auto parameter =
-          static_cast<std::size_t>(group0 / group_size) * layout.N + col;
-      const float ws = as_float(as_bf16(decoded.scales[parameter]));
-      const float wb = as_float(as_bf16(decoded.biases[parameter]));
-      if (layout.compute_type == "int8") {
-        float maximum = 0.0f;
-        for (int x = 0; x < group_size; ++x)
-          maximum = std::max(
-              maximum, std::abs(as_float(
-                           inputs.A[static_cast<std::size_t>(row) * layout.K +
-                                    group0 + x])));
-        const float quant_scale = maximum == 0.0f ? 1.0f : maximum / 127.0f;
-        const float stored_scale = as_float(as_bf16(quant_scale));
-        int dot = 0;
-        int sum = 0;
-        for (int x = 0; x < group_size; ++x) {
-          const float a = as_float(
-              inputs.A[static_cast<std::size_t>(row) * layout.K + group0 + x]);
-          int q =
-              static_cast<int>(a / quant_scale + (a >= 0.0f ? 0.5f : -0.5f));
-          q = std::clamp(q, -127, 127);
-          sum += q;
-          dot +=
-              q *
-              decoded.q[static_cast<std::size_t>(group0 + x) * layout.N + col];
-        }
-        accumulator += stored_scale * (ws * dot - wb * sum);
-      } else if (layout.compute_type == "bfp16") {
-        for (int x = 0; x < group_size; x += 8) {
-          float activation[8], weights[8], rounded_a[8], rounded_b[8];
-          for (int lane = 0; lane < 8; ++lane) {
-            const int inner = group0 + x + lane;
-            activation[lane] = as_float(
-                inputs.A[static_cast<std::size_t>(row) * layout.K + inner]);
-            const auto q =
-                decoded.q[static_cast<std::size_t>(inner) * layout.N + col];
-            weights[lane] = as_float(as_bf16(static_cast<float>(q) * ws - wb));
-          }
-          round_bfp16ebs8(activation, rounded_a);
-          round_bfp16ebs8(weights, rounded_b);
-          for (int lane = 0; lane < 8; ++lane)
-            accumulator += rounded_a[lane] * rounded_b[lane];
-        }
-      } else {
-        for (int x = 0; x < group_size; ++x) {
-          const auto a =
-              inputs.A[static_cast<std::size_t>(row) * layout.K + group0 + x];
-          const auto q =
-              decoded.q[static_cast<std::size_t>(group0 + x) * layout.N + col];
-          const float weight =
-              as_float(as_bf16(static_cast<float>(q) * ws - wb));
-          accumulator += as_float(a) * weight;
-        }
+  if (round_tile_partials && layout.accumulation_mode == "cascade-hybrid") {
+    constexpr int cascade_rows = 2;
+    const int chunks_per_row = layout.K / (cascade_rows * layout.k);
+    float row_partials[cascade_rows] = {};
+    for (int cascade_row = 0; cascade_row < cascade_rows; ++cascade_row) {
+      for (int chunk = 0; chunk < chunks_per_row; ++chunk) {
+        const int kt = (chunk * cascade_rows + cascade_row) * layout.k;
+        reference_accumulate_tile(layout, inputs, decoded, row, col, kt,
+                                  row_partials[cascade_row]);
+        if (chunk + 1 != chunks_per_row)
+          row_partials[cascade_row] =
+              as_float(as_bf16(row_partials[cascade_row]));
       }
     }
+    float accumulator = row_partials[cascade_rows - 1];
+    for (int cascade_row = cascade_rows - 2; cascade_row >= 0; --cascade_row)
+      accumulator += row_partials[cascade_row];
+    return as_float(as_bf16(accumulator));
+  }
+
+  float accumulator = 0.0f;
+  for (int kt = 0; kt < layout.K; kt += layout.k) {
+    reference_accumulate_tile(layout, inputs, decoded, row, col, kt,
+                              accumulator);
     if (round_tile_partials)
       accumulator = as_float(as_bf16(accumulator));
   }

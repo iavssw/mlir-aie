@@ -93,6 +93,16 @@ def candidates(opts) -> list[dict]:
             n=64,
         ),
         dict(
+            name="bfp16-cascade-hybrid",
+            compute_type="bfp16",
+            accumulation_mode="cascade-hybrid",
+            cache_mode="l1-weight",
+            m_c=256,
+            m_a=32,
+            k=128,
+            n=64,
+        ),
+        dict(
             name="int8-l1-atb",
             compute_type="int8",
             cache_mode="l1-weight",

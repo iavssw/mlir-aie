@@ -87,6 +87,79 @@ class RuntimeTapTests(unittest.TestCase):
         for tap in c:
             self.assertLessEqual(max(tap.sizes), 1023)
 
+    def test_large_hybrid_cascade_coverage_and_bounded_replay(self):
+        a, b, c = generate_taps(
+            M=2048,
+            K=4096,
+            N=512,
+            m_c=256,
+            m_a=32,
+            k=128,
+            n=64,
+            n_aie_cols=8,
+            compute_type="bfp16",
+            accumulation_mode="cascade-hybrid",
+            cache_mode="memtile-weight",
+            activation_input="bf16",
+            cache_k=4096,
+        )
+        a_count = a.access_count()
+        b_count = b.access_count().ravel()
+        c_count = c.access_count()
+        self.assertTrue(np.all(a_count == 1))
+        self.assertTrue(np.all(b_count == 1))
+        self.assertTrue(np.all(c_count == 1))
+        self.assertEqual(len(a), 4)
+        self.assertEqual(len(b), 8)
+        self.assertEqual(len(c), 16)
+        self.assertEqual(
+            [tap.offset for tap in b[:8]],
+            [column * 163840 for column in range(8)],
+        )
+        self.assertEqual(
+            [tap.offset for tap in a[:4]], [0, 128, 1048576, 1048704]
+        )
+
+    def test_large_hybrid_cascade_l1_weight_coverage(self):
+        a, b, c = generate_taps(
+            M=2048,
+            K=4096,
+            N=512,
+            m_c=256,
+            m_a=32,
+            k=128,
+            n=64,
+            n_aie_cols=8,
+            compute_type="bfp16",
+            accumulation_mode="cascade-hybrid",
+            cache_mode="l1-weight",
+            activation_input="bf16",
+            cache_k=4096,
+        )
+        np.testing.assert_array_equal(
+            a.access_count(), np.ones((2048, 4096))
+        )
+        np.testing.assert_array_equal(
+            b.access_count().ravel(), np.full((1310720,), 4)
+        )
+        np.testing.assert_array_equal(
+            c.access_count(), np.ones((2048, 512))
+        )
+        self.assertEqual((len(a), len(b), len(c)), (16, 32, 16))
+        self.assertEqual(
+            [tap.offset for tap in a[:4]], [0, 128, 1048576, 1048704]
+        )
+        self.assertEqual(
+            [tap.offset for tap in b[:4]], [0, 163840, 327680, 491520]
+        )
+
+    def test_hybrid_middle_worker_balances_fifo_acquire_release(self):
+        source = (WHOLE_ARRAY / "whole_array.py").read_text()
+        middle = source.split("def hybrid_middle_fn(", 1)[1].split(
+            "def hybrid_top_fn(", 1
+        )[0]
+        self.assertEqual(middle.count("elem_a = in_a.acquire(1)"), 2)
+        self.assertEqual(middle.count("in_a.release(1)"), 2)
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,7 +54,7 @@ perf-ceiling: perf-bfp16
 perf-ceiling-3x:
 	python3 ${srcdir}/benchmark_sweep.py --hardware -M 4096 -K 4096 -N 4096 --compute-types bfp16 --accumulation-modes bf16 --cache-modes l1-weight --warmup 16 --iters 20 --rounds 3 --min-gflops 12000
 
-.PHONY: perf-fp32 perf-cascade perf-memtile
+.PHONY: perf-fp32 perf-cascade perf-cascade-hybrid perf-cascade-hybrid-3x perf-memtile
 perf-fp32: M=4096
 perf-fp32: K=4096
 perf-fp32: N=4096
@@ -86,6 +86,31 @@ perf-cascade: iters=20
 perf-cascade: verify=true
 perf-cascade: min_gflops=7000
 perf-cascade: run
+
+# Performance-oriented physical-cascade design. Two independent two-row chains
+# keep prefix K tiles in the fast BF16-writeback kernel, then reduce the final
+# tile in accfloat before one BF16 write at the top of each chain.
+perf-cascade-hybrid: M=4096
+perf-cascade-hybrid: K=4096
+perf-cascade-hybrid: N=4096
+perf-cascade-hybrid: m_c=256
+perf-cascade-hybrid: m_a=32
+perf-cascade-hybrid: k=128
+perf-cascade-hybrid: n=64
+perf-cascade-hybrid: n_aie_cols=8
+perf-cascade-hybrid: compute_type=bfp16
+perf-cascade-hybrid: accumulation_mode=cascade-hybrid
+perf-cascade-hybrid: cache_mode=l1-weight
+perf-cascade-hybrid: cache_k=4096
+perf-cascade-hybrid: warmup=16
+perf-cascade-hybrid: iters=20
+perf-cascade-hybrid: verify=true
+perf-cascade-hybrid: verify_samples=1000
+perf-cascade-hybrid: min_gflops=16000
+perf-cascade-hybrid: run
+
+perf-cascade-hybrid-3x:
+	python3 ${srcdir}/benchmark_sweep.py --hardware -M 4096 -K 4096 -N 4096 --compute-types bfp16 --accumulation-modes cascade-hybrid --cache-modes l1-weight --warmup 16 --iters 20 --rounds 3 --min-gflops 16000
 
 perf-memtile: M=4096
 perf-memtile: K=4096

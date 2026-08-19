@@ -27,13 +27,23 @@ Q4_K_BLOCK_BYTES = 144
 Q4_K_SCALE_BYTES = 12
 Q4_K_GROUP = 32
 N_AIE_ROWS = 4
+CASCADE_CHUNK_K = 256
 CORE_MEMORY_BYTES = 64 * 1024
 MEMTILE_MEMORY_BYTES = 512 * 1024
 CORE_STACK_BYTES = 0xD00
 CORE_SAFETY_BYTES = 4 * 1024
 MEMTILE_SAFETY_BYTES = 32 * 1024
 COMPUTE_TYPES = ("bf16", "bfp16", "int8")
-ACCUMULATION_MODES = ("bf16", "fp32", "cascade")
+ACCUMULATION_MODES = (
+    "bf16",
+    "fp32",
+    "cascade",
+    "cascade-resident",
+    "cascade-register",
+    "cascade-chunked",
+    "cascade-shared",
+    "cascade-hybrid",
+)
 CACHE_MODES = (
     "stream",
     "l1-weight",
@@ -121,6 +131,29 @@ class Q4KSConfig:
         return self.tile_bytes - self.raw_tile_bytes
 
     @property
+    def weight_storage_type(self) -> str:
+        """Prepared-weight representation consumed by the selected design."""
+
+        return (
+            "bfp16"
+            if self.accumulation_mode
+            in (
+                "cascade-resident",
+                "cascade-register",
+                "cascade-chunked",
+            )
+            else "q4"
+        )
+
+    @property
+    def runtime_tile_bytes(self) -> int:
+        return self.prepared_tile_bytes(self.weight_storage_type)
+
+    @property
+    def runtime_packed_rows(self) -> int:
+        return ceildiv(self.runtime_tile_bytes, self.k)
+
+    @property
     def n_k_tiles(self) -> int:
         return self.K // self.k
 
@@ -138,6 +171,10 @@ class Q4KSConfig:
 
     @property
     def prepared_bytes(self) -> int:
+        return self.n_tiles * self.runtime_tile_bytes
+
+    @property
+    def q4_prepared_bytes(self) -> int:
         return self.n_tiles * self.tile_bytes
 
     @property
@@ -150,7 +187,16 @@ class Q4KSConfig:
         # validated 64x64 tile still fits with that depth.
         if self.accumulation_mode == "cascade":
             return 2
+        if self.accumulation_mode in (
+            "cascade-resident",
+            "cascade-register",
+            "cascade-chunked",
+            "cascade-shared",
+            "cascade-hybrid",
+        ):
+            return 1
         return 1 if self.m_a >= 64 else 2
+
 
     def prepared_tile_bytes(self, storage_type: str) -> int:
         if storage_type == "q4":
@@ -170,12 +216,55 @@ class Q4KSConfig:
 
     @property
     def core_memory_components(self) -> dict[str, int]:
+        if self.accumulation_mode == "cascade-hybrid":
+            return {
+                "A 32-row K-tile FIFO": self.m_a * self.k * 2,
+                "compressed Q4_K tile FIFO": self.tile_bytes,
+                "BFP16 weight scratch": self.k * self.n * 9 // 8,
+                "BF16 local K/2 partial": self.m_c * self.n * 2,
+                "stack": CORE_STACK_BYTES,
+                "safety margin": CORE_SAFETY_BYTES,
+            }
+
+        if self.accumulation_mode == "cascade-shared":
+            return {
+                "A 16-row K-tile FIFO": self.m_a * self.k * 2,
+                "compressed Q4_K tile FIFO": self.tile_bytes,
+                "BFP16 weight scratch": self.k * self.n * 9 // 8,
+                "neighbor-split FP32 accumulation scratch": (
+                    self.m_c * self.n * 2
+                ),
+                "stack": CORE_STACK_BYTES,
+                "safety margin": CORE_SAFETY_BYTES,
+            }
+
+        if self.accumulation_mode == "cascade-chunked":
+            return {
+                "A 16-row chunk FIFO": 16 * CASCADE_CHUNK_K * 2,
+                "B full-N chunk FIFO": CASCADE_CHUNK_K * self.n * 9 // 8,
+                "FP32 accumulation scratch": self.m_c * self.n * 4,
+                "stack": CORE_STACK_BYTES,
+                "safety margin": CORE_SAFETY_BYTES,
+            }
+
+        if self.accumulation_mode == "cascade-register":
+            shard_k = self.K // N_AIE_ROWS
+            return {
+                "A 16-row K-shard FIFO": 16 * shard_k * 2,
+                "B 16-column K-shard FIFO": shard_k * 16 * 9 // 8,
+                "stack": CORE_STACK_BYTES,
+                "safety margin": CORE_SAFETY_BYTES,
+            }
+
         weight_scratch = {
             "bf16": self.k * self.n * 2,
             "bfp16": self.k * self.n * 9 // 8,
             "int8": self.k * self.n,
         }[self.compute_type]
         activation_scratch = 0
+        if self.accumulation_mode == "cascade-resident":
+            # The input FIFO already contains native AIE BFP16 blocks.
+            weight_scratch = 0
         if self.compute_type == "int8":
             activation_scratch = (
                 self.m_a * self.k
@@ -185,7 +274,7 @@ class Q4KSConfig:
             f"A FIFO (depth {self.a_fifo_depth})": (
                 self.a_fifo_depth * self.m_a * self.k * 2
             ),
-            "packed-B FIFO (depth 1)": self.tile_bytes,
+            "prepared-B FIFO (depth 1)": self.runtime_tile_bytes,
             f"C FIFO (depth {self.c_fifo_depth})": (
                 self.c_fifo_depth * self.m_c * self.n * 2
             ),
@@ -194,8 +283,11 @@ class Q4KSConfig:
             "stack": CORE_STACK_BYTES,
             "safety margin": CORE_SAFETY_BYTES,
         }
-        if self.accumulation_mode in ("fp32", "cascade"):
+        if self.accumulation_mode in ("fp32", "cascade", "cascade-resident"):
             components["FP32 accumulation scratch"] = self.m_c * self.n * 4
+        if self.accumulation_mode == "cascade-resident":
+            # The result ObjectFIFO is allocated in the adjacent MemTile.
+            components[f"C FIFO (depth {self.c_fifo_depth})"] = 0
         return components
 
     @property
@@ -215,8 +307,50 @@ class Q4KSConfig:
         raise ValueError("activation cache storage must be bf16, bfp16, or int8")
 
     def memtile_components(self, storage_type: str | None = None) -> dict[str, int]:
+        if self.accumulation_mode in ("cascade-shared", "cascade-hybrid"):
+            return {
+                "resident compressed-Q4_K panel": (
+                    self.panel_bytes("q4")
+                    if self.cache_mode == "memtile-weight"
+                    else 0
+                ),
+                "streamed compressed-Q4_K panel": (
+                    self.panel_bytes("q4")
+                    if self.cache_mode == "l1-weight"
+                    else 0
+                ),
+                "double-buffered activation K tile": (
+                    2 * self.m_c * self.k * 2
+                ),
+                "C staging": (
+                    self.m_c * self.n * 2
+                    if self.accumulation_mode == "cascade-hybrid"
+                    else 0
+                ),
+                "safety margin": MEMTILE_SAFETY_BYTES,
+            }
+
+        if self.accumulation_mode == "cascade-chunked":
+            return {
+                "resident expanded-B panel": self.K * self.n * 9 // 8,
+                "double-buffered activation chunk": (
+                    2 * self.m_c * CASCADE_CHUNK_K * 2
+                ),
+                "C staging": 0,
+                "safety margin": MEMTILE_SAFETY_BYTES,
+            }
+
+        if self.accumulation_mode == "cascade-register":
+            shard_k = self.K // N_AIE_ROWS
+            return {
+                "resident expanded-B panel": self.K * self.n * 9 // 8,
+                "resident activation K-shard": self.m_c * shard_k * 2,
+                "C staging": 0,
+                "safety margin": MEMTILE_SAFETY_BYTES,
+            }
+
         storage = storage_type or (
-            "q4"
+            self.weight_storage_type
             if self.cache_mode == "memtile-weight"
             else (
                 "bfp16"
@@ -239,7 +373,8 @@ class Q4KSConfig:
             "resident weight panel": weight,
             "resident activation panel": activation,
             "C join staging": N_AIE_ROWS * self.m_c * self.n * 2,
-            "stream staging": 2 * (self.m_a * self.k * 2 + self.tile_bytes),
+            "stream staging": 2
+            * (self.m_a * self.k * 2 + self.runtime_tile_bytes),
             "safety margin": MEMTILE_SAFETY_BYTES,
         }
 
@@ -286,6 +421,86 @@ class Q4KSConfig:
                 )
         if self.m_a % 16:
             raise ValueError("m_a must be divisible by 16")
+        if self.accumulation_mode == "cascade-resident":
+            if self.m_a != self.m_c:
+                raise ValueError(
+                    "cascade-resident accumulation requires m_a == m_c"
+                )
+            if self.K % (N_AIE_ROWS * self.k):
+                raise ValueError(
+                    "cascade-resident accumulation requires 4*k to divide K"
+                )
+            if self.cache_mode != "memtile-weight":
+                raise ValueError(
+                    "cascade-resident accumulation requires memtile-weight"
+                )
+        if self.accumulation_mode == "cascade-register":
+            if self.m_a != 16:
+                raise ValueError(
+                    "cascade-register accumulation requires m_a == 16"
+                )
+            if (self.K // N_AIE_ROWS) % 8:
+                raise ValueError(
+                    "cascade-register requires each K/4 shard to be divisible by 8"
+                )
+            if self.cache_mode != "memtile-weight":
+                raise ValueError(
+                    "cascade-register accumulation requires memtile-weight"
+                )
+        if self.accumulation_mode == "cascade-chunked":
+            if self.m_a != 16:
+                raise ValueError(
+                    "cascade-chunked accumulation requires m_a == 16"
+                )
+            if self.K % (N_AIE_ROWS * CASCADE_CHUNK_K):
+                raise ValueError(
+                    "cascade-chunked requires 4*256 to divide K"
+                )
+            if self.cache_mode != "memtile-weight":
+                raise ValueError(
+                    "cascade-chunked accumulation requires memtile-weight"
+                )
+        if self.accumulation_mode == "cascade-shared":
+            if (self.m_c, self.m_a, self.k, self.n) != (128, 16, 64, 128):
+                raise ValueError(
+                    "cascade-shared requires m_c=128, m_a=16, k=64, n=128"
+                )
+            if self.K % (N_AIE_ROWS * self.k):
+                raise ValueError(
+                    "cascade-shared requires 4*k to divide K"
+                )
+            if self.cache_mode != "memtile-weight":
+                raise ValueError(
+                    "cascade-shared accumulation requires memtile-weight"
+                )
+            if self.m_c * self.n * 2 > CORE_MEMORY_BYTES // 2:
+                raise ValueError(
+                    "each shared FP32 accumulator half must fit in 32 KiB"
+                )
+        if self.accumulation_mode == "cascade-hybrid":
+            hybrid_tiles = {
+                (128, 32, 64, 128),
+                (128, 64, 128, 64),
+                (256, 32, 64, 64),
+                (256, 64, 64, 64),
+                (256, 32, 128, 64),
+                (512, 32, 64, 32),
+                (512, 64, 64, 32),
+            }
+            if (self.m_c, self.m_a, self.k, self.n) not in hybrid_tiles:
+                raise ValueError(
+                    "cascade-hybrid requires one of: "
+                    "(m_c,m_a,k,n)=(128,32,64,128), "
+                    "(128,64,128,64), (256,32|64,64,64), "
+                    "(256,32,128,64), or (512,32|64,64,32)"
+                )
+            if self.K % (2 * self.k):
+                raise ValueError("cascade-hybrid requires 2*k to divide K")
+            if self.cache_mode not in ("l1-weight", "memtile-weight"):
+                raise ValueError(
+                    "cascade-hybrid accumulation requires l1-weight or "
+                    "memtile-weight"
+                )
         if self.n % 16:
             raise ValueError("n must be divisible by 16")
         if self.M % (self.m_c * N_AIE_ROWS):
@@ -309,6 +524,39 @@ class Q4KSConfig:
         }
         if self.accumulation_mode == "cascade":
             dma_sizes["4*packed_rows"] = N_AIE_ROWS * self.packed_rows
+        if self.accumulation_mode == "cascade-resident":
+            dma_sizes["4*runtime_packed_rows"] = (
+                N_AIE_ROWS * self.runtime_packed_rows
+            )
+        if self.accumulation_mode == "cascade-register":
+            dma_sizes.update(
+                {
+                    "K/32": self.K // 32,
+                    "m_c/16": self.m_c // 16,
+                    "n/16": self.n // 16,
+                }
+            )
+        if self.accumulation_mode == "cascade-chunked":
+            dma_sizes.update(
+                {
+                    "K/1024": self.K // (N_AIE_ROWS * CASCADE_CHUNK_K),
+                    "256/8": CASCADE_CHUNK_K // 8,
+                }
+            )
+        if self.accumulation_mode == "cascade-shared":
+            dma_sizes.update(
+                {
+                    "K/(4*k)": self.K // (N_AIE_ROWS * self.k),
+                    "packed tile rows": self.packed_rows,
+                }
+            )
+        if self.accumulation_mode == "cascade-hybrid":
+            dma_sizes.update(
+                {
+                    "K/(2*k)": self.K // (2 * self.k),
+                    "packed tile rows": self.packed_rows,
+                }
+            )
         bad_dma = {k: v for k, v in dma_sizes.items() if v > 1023}
         if bad_dma:
             details = ", ".join(f"{k}={v}" for k, v in bad_dma.items())
@@ -532,6 +780,27 @@ def _tile_coordinates(config: Q4KSConfig) -> Iterable[tuple[int, int, int]]:
                 yield col, k_tile, n_tile
 
 
+def _compressed_tile_coordinates(
+    config: Q4KSConfig,
+) -> Iterable[tuple[int, int, int]]:
+    """Order compressed tiles for independent cores or K-split cascades."""
+
+    if config.accumulation_mode not in ("cascade-shared", "cascade-hybrid"):
+        yield from _tile_coordinates(config)
+        return
+    cascade_rows = (
+        2 if config.accumulation_mode == "cascade-hybrid" else N_AIE_ROWS
+    )
+    per_col = config.n_n_tiles // config.n_aie_cols
+    chunks = config.n_k_tiles // cascade_rows
+    for col in range(config.n_aie_cols):
+        for n_round in range(per_col):
+            n_tile = col + n_round * config.n_aie_cols
+            for row in range(cascade_rows):
+                for chunk in range(chunks):
+                    yield col, chunk * cascade_rows + row, n_tile
+
+
 def _microtile_values(values: np.ndarray, k: int, n: int) -> Iterator[np.ndarray]:
     for micro_k in range(0, k, 8):
         for micro_n in range(0, n, 8):
@@ -541,10 +810,10 @@ def _microtile_values(values: np.ndarray, k: int, n: int) -> Iterator[np.ndarray
 def _pack_compressed(
     q: np.ndarray, scales: np.ndarray, biases: np.ndarray, config: Q4KSConfig
 ) -> np.ndarray:
-    packed = np.zeros(config.prepared_bytes, dtype=np.uint8)
+    packed = np.zeros(config.q4_prepared_bytes, dtype=np.uint8)
     scales_bf16 = scales.astype(bfloat16)
     biases_bf16 = biases.astype(bfloat16)
-    for ti, (_, kt, nt) in enumerate(_tile_coordinates(config)):
+    for ti, (_, kt, nt) in enumerate(_compressed_tile_coordinates(config)):
         k0, n0 = kt * config.k, nt * config.n
         tile = packed[ti * config.tile_bytes : (ti + 1) * config.tile_bytes]
         cursor = 0
@@ -570,11 +839,11 @@ def _pack_compressed(
 def unpack_prepared_q4(
     packed: np.ndarray, config: Q4KSConfig
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    packed = _require_array("packed", packed, (config.prepared_bytes,), np.uint8)
+    packed = _require_array("packed", packed, (config.q4_prepared_bytes,), np.uint8)
     q = np.empty((config.K, config.N), dtype=np.uint8)
     scales = np.empty((config.K // Q4_K_GROUP, config.N), dtype=bfloat16)
     biases = np.empty_like(scales)
-    for ti, (_, kt, nt) in enumerate(_tile_coordinates(config)):
+    for ti, (_, kt, nt) in enumerate(_compressed_tile_coordinates(config)):
         k0, n0 = kt * config.k, nt * config.n
         tile = packed[ti * config.tile_bytes : (ti + 1) * config.tile_bytes]
         cursor = 0
@@ -708,6 +977,102 @@ def _pack_expanded(
     return result
 
 
+def _pack_expanded_cascade_register(
+    q: np.ndarray,
+    scales: np.ndarray,
+    biases: np.ndarray,
+    config: Q4KSConfig,
+) -> np.ndarray:
+    """Pack BFP16 by cascade row, 16-column panel, then the full K/4 shard.
+
+    This model-load representation lets a MemTile replay one 16-column B
+    panel while a compute tile keeps all K/4 partial sums in accfloat
+    registers.  No FP32 partial-C buffer is read or written.
+    """
+
+    shard_k = config.K // N_AIE_ROWS
+    result = np.empty(config.prepared_bytes, dtype=np.uint8)
+    scales_bf16 = scales.astype(bfloat16)
+    biases_bf16 = biases.astype(bfloat16)
+    groups = np.arange(config.K) // Q4_K_GROUP
+    dequant = (
+        q.astype(np.float32) * scales_bf16[groups].astype(np.float32)
+        - biases_bf16[groups].astype(np.float32)
+    ).astype(bfloat16)
+
+    cursor = 0
+    n_rounds = config.N // (config.n * config.n_aie_cols)
+    for col in range(config.n_aie_cols):
+        for n_round in range(n_rounds):
+            n0 = (n_round * config.n_aie_cols + col) * config.n
+            for row in range(N_AIE_ROWS):
+                k0 = row * shard_k
+                for n16 in range(0, config.n, 16):
+                    for k8 in range(0, shard_k, 8):
+                        for n8 in (0, 8):
+                            block = dequant[
+                                k0 + k8 : k0 + k8 + 8,
+                                n0 + n16 + n8 : n0 + n16 + n8 + 8,
+                            ]
+                            raw = float_to_bfp16ebs8(
+                                block.astype(np.float32).T.reshape(-1)
+                            )
+                            result[cursor : cursor + raw.size] = raw
+                            cursor += raw.size
+    if cursor != config.prepared_bytes:
+        raise AssertionError(
+            f"cascade-register packing wrote {cursor}, "
+            f"expected {config.prepared_bytes}"
+        )
+    return result
+
+
+def _pack_expanded_cascade_chunked(
+    q: np.ndarray,
+    scales: np.ndarray,
+    biases: np.ndarray,
+    config: Q4KSConfig,
+) -> np.ndarray:
+    """Pack BFP16 by cascade row and 256-K full-N compute chunk."""
+
+    shard_k = config.K // N_AIE_ROWS
+    result = np.empty(config.prepared_bytes, dtype=np.uint8)
+    scales_bf16 = scales.astype(bfloat16)
+    biases_bf16 = biases.astype(bfloat16)
+    groups = np.arange(config.K) // Q4_K_GROUP
+    dequant = (
+        q.astype(np.float32) * scales_bf16[groups].astype(np.float32)
+        - biases_bf16[groups].astype(np.float32)
+    ).astype(bfloat16)
+
+    cursor = 0
+    n_rounds = config.N // (config.n * config.n_aie_cols)
+    for col in range(config.n_aie_cols):
+        for n_round in range(n_rounds):
+            n0 = (n_round * config.n_aie_cols + col) * config.n
+            for row in range(N_AIE_ROWS):
+                row_k0 = row * shard_k
+                for chunk in range(0, shard_k, CASCADE_CHUNK_K):
+                    k0 = row_k0 + chunk
+                    for k8 in range(0, CASCADE_CHUNK_K, 8):
+                        for n8 in range(0, config.n, 8):
+                            block = dequant[
+                                k0 + k8 : k0 + k8 + 8,
+                                n0 + n8 : n0 + n8 + 8,
+                            ]
+                            raw = float_to_bfp16ebs8(
+                                block.astype(np.float32).T.reshape(-1)
+                            )
+                            result[cursor : cursor + raw.size] = raw
+                            cursor += raw.size
+    if cursor != config.prepared_bytes:
+        raise AssertionError(
+            f"cascade-chunked packing wrote {cursor}, "
+            f"expected {config.prepared_bytes}"
+        )
+    return result
+
+
 def prepare_q4ks_weights(
     native: np.ndarray,
     config: Q4KSConfig,
@@ -718,6 +1083,13 @@ def prepare_q4ks_weights(
     q, scales, biases = decode_q4_k(native, K=config.K, N=config.N)
     if storage_type == "q4":
         return _pack_compressed(q, scales, biases, config)
+    if storage_type == "bfp16" and config.accumulation_mode == "cascade-register":
+        return _pack_expanded_cascade_register(q, scales, biases, config)
+    if (
+        storage_type == "bfp16"
+        and config.accumulation_mode == "cascade-chunked"
+    ):
+        return _pack_expanded_cascade_chunked(q, scales, biases, config)
     return _pack_expanded(q, scales, biases, config, storage_type)
 
 
@@ -799,6 +1171,27 @@ def reference_matmul(
         weights = rounded
     else:
         A_compute = A.astype(np.float32)
+    if config.accumulation_mode == "cascade-hybrid":
+        cascade_rows = 2
+        chunks_per_row = config.K // (cascade_rows * config.k)
+        row_partials: list[np.ndarray] = []
+        for cascade_row in range(cascade_rows):
+            partial = np.zeros((config.M, config.N), dtype=np.float32)
+            for chunk in range(chunks_per_row):
+                k0 = (chunk * cascade_rows + cascade_row) * config.k
+                ks = slice(k0, k0 + config.k)
+                partial = (
+                    partial
+                    + A_compute[:, ks] @ weights[ks].astype(np.float32)
+                )
+                if chunk + 1 != chunks_per_row:
+                    partial = partial.astype(bfloat16).astype(np.float32)
+            row_partials.append(partial)
+        C = row_partials[-1]
+        for cascade_row in range(cascade_rows - 2, -1, -1):
+            C = C + row_partials[cascade_row]
+        return C.astype(bfloat16)
+
     C = np.zeros((config.M, config.N), dtype=np.float32)
     for k0 in range(0, config.K, config.k):
         ks = slice(k0, k0 + config.k)

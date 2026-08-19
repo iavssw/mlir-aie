@@ -42,6 +42,66 @@ def main():
             raise AssertionError(completed.stdout)
         actual = np.fromfile(prepared_path, dtype=np.uint8)
         np.testing.assert_array_equal(actual, expected)
+        hybrid_cfg = Q4KSConfig(
+            M=2048,
+            K=1024,
+            N=512,
+            m_c=256,
+            m_a=32,
+            k=128,
+            n=64,
+            n_aie_cols=8,
+            compute_type="bfp16",
+            accumulation_mode="cascade-hybrid",
+            cache_mode="memtile-weight",
+            cache_k=1024,
+        )
+        _, hybrid_native = make_deterministic_native_q4_k(hybrid_cfg)
+        hybrid_expected = prepare_q4ks_weights(hybrid_native, hybrid_cfg)
+        hybrid_native_path = Path(directory) / "hybrid-native.bin"
+        hybrid_prepared_path = Path(directory) / "hybrid-prepared.bin"
+        hybrid_native.tofile(hybrid_native_path)
+        hybrid_completed = subprocess.run(
+            [
+                str(executable),
+                "-M",
+                "2048",
+                "-K",
+                "1024",
+                "-N",
+                "512",
+                "--tile-m-c",
+                "256",
+                "--tile-m-a",
+                "32",
+                "--tile-k",
+                "128",
+                "--tile-n",
+                "64",
+                "--n-aie-cols",
+                "8",
+                "--compute-type",
+                "bfp16",
+                "--accumulation-mode",
+                "cascade-hybrid",
+                "--cache-mode",
+                "memtile-weight",
+                "--cache-k",
+                "1024",
+                "--q4-k-file",
+                str(hybrid_native_path),
+                "--prepare-output",
+                str(hybrid_prepared_path),
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        if "PASS!" not in hybrid_completed.stdout:
+            raise AssertionError(hybrid_completed.stdout)
+        hybrid_actual = np.fromfile(hybrid_prepared_path, dtype=np.uint8)
+        np.testing.assert_array_equal(hybrid_actual, hybrid_expected)
+
 
         generated_path = Path(directory) / "generated.bin"
         generated = subprocess.run(
