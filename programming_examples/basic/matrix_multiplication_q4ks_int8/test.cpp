@@ -121,8 +121,6 @@ int main(int argc, const char *argv[]) {
       "n-aie-cols", "NPU2 columns", cxxopts::value<int>()->default_value("8"))(
       "compute-type", "bf16, bfp16, or int8",
       cxxopts::value<std::string>()->default_value("bf16"))(
-      "accumulation-mode", "bf16 tile writeback, fp32 scratch, or cascade",
-      cxxopts::value<std::string>()->default_value("bf16"))(
       "cache-mode", "stream, l1-weight, or memtile-weight",
       cxxopts::value<std::string>()->default_value("stream"))(
       "cache-k", "resident K extent (zero means K)",
@@ -159,7 +157,6 @@ int main(int argc, const char *argv[]) {
   layout.n = args["tile-n"].as<int>();
   layout.n_aie_cols = args["n-aie-cols"].as<int>();
   layout.compute_type = args["compute-type"].as<std::string>();
-  layout.accumulation_mode = args["accumulation-mode"].as<std::string>();
   layout.cache_mode = args["cache-mode"].as<std::string>();
   layout.cache_k = args["cache-k"].as<int>();
   if (layout.cache_k == 0)
@@ -346,7 +343,6 @@ int main(int argc, const char *argv[]) {
   std::cout << "Matrix " << layout.M << 'x' << layout.K << 'x' << layout.N
             << ", tile " << layout.m_c << '/' << layout.m_a << 'x' << layout.k
             << 'x' << layout.n << ", " << layout.compute_type << ", "
-            << layout.accumulation_mode << " accumulation, "
             << layout.cache_mode << ", " << layout.n_aie_cols << " columns\n";
   std::cout << "Native/prepared B bytes: " << inputs.native_B.size() << " / "
             << prepared.size() << " (" << layout.tile_bytes() << " per tile)\n";
@@ -362,14 +358,6 @@ int main(int argc, const char *argv[]) {
   double max_rel = 0.0;
   double squared_error = 0.0;
   double squared_reference = 0.0;
-  int fp32_errors = 0;
-  double fp32_max_abs = 0.0;
-  double fp32_max_rel = 0.0;
-  double fp32_squared_error = 0.0;
-  double fp32_squared_reference = 0.0;
-  double accumulation_drift_max_abs = 0.0;
-  double accumulation_drift_squared = 0.0;
-  double accumulation_drift_reference = 0.0;
   int native_errors = 0;
   double native_max_abs = 0.0;
   double native_max_rel = 0.0;
@@ -390,8 +378,7 @@ int main(int argc, const char *argv[]) {
       const int row = sampled ? rows(rng) : sample / layout.N;
       const int col = sampled ? cols(rng) : sample % layout.N;
       const float expected =
-          q4ks::reference_value(layout, inputs, decoded, row, col,
-                                layout.accumulation_mode == "bf16");
+          q4ks::reference_value(layout, inputs, decoded, row, col);
       const float actual = q4ks::as_float(
           output[static_cast<std::size_t>(row) * layout.N + col]);
       const double difference = std::abs(actual - expected);
@@ -408,32 +395,8 @@ int main(int argc, const char *argv[]) {
         ++errors;
       }
 
-      const float fp32_expected =
-          q4ks::reference_value(layout, inputs, decoded, row, col, false);
-      const float tile_writeback_expected =
-          layout.accumulation_mode == "bf16"
-              ? expected
-              : q4ks::reference_value(layout, inputs, decoded, row, col, true);
-      const double accumulation_drift =
-          std::abs(tile_writeback_expected - fp32_expected);
-      accumulation_drift_max_abs =
-          std::max(accumulation_drift_max_abs, accumulation_drift);
-      accumulation_drift_squared += accumulation_drift * accumulation_drift;
-      accumulation_drift_reference +=
-          static_cast<double>(fp32_expected) * fp32_expected;
-      const double fp32_difference = std::abs(actual - fp32_expected);
-      fp32_max_abs = std::max(fp32_max_abs, fp32_difference);
-      fp32_max_rel = std::max(fp32_max_rel,
-                              fp32_difference /
-                                  std::max(std::abs(fp32_expected), 1.0e-12f));
-      fp32_squared_error += fp32_difference * fp32_difference;
-      fp32_squared_reference +=
-          static_cast<double>(fp32_expected) * fp32_expected;
-      if (!q4ks::close(actual, fp32_expected))
-        ++fp32_errors;
-
       const float native_expected = q4ks::reference_value(
-          native_reference_layout, inputs, decoded, row, col, false);
+          native_reference_layout, inputs, decoded, row, col);
       const double native_difference = std::abs(actual - native_expected);
       native_max_abs = std::max(native_max_abs, native_difference);
       native_max_rel = std::max(
@@ -449,37 +412,21 @@ int main(int argc, const char *argv[]) {
         std::sqrt(squared_error / sample_count) /
         std::max(std::sqrt(squared_reference / sample_count), 1.0e-12);
     std::cout << (sampled ? "Sampled" : "Full")
-              << " verification: max_abs=" << max_abs << ", max_rel=" << max_rel
-              << ", nrmse=" << nrmse << '\n';
-    const double fp32_nrmse =
-        std::sqrt(fp32_squared_error / sample_count) /
-        std::max(std::sqrt(fp32_squared_reference / sample_count), 1.0e-12);
-    std::cout << (sampled ? "Sampled" : "Full")
-              << " BFP16-FP32-accumulation reference: max_abs=" << fp32_max_abs
-              << ", max_rel=" << fp32_max_rel << ", nrmse=" << fp32_nrmse
-              << ", mismatches=" << fp32_errors << '\n';
-    const double accumulation_drift_nrmse =
-        std::sqrt(accumulation_drift_squared / sample_count) /
-        std::max(std::sqrt(accumulation_drift_reference / sample_count),
-                 1.0e-12);
-    std::cout << (sampled ? "Sampled" : "Full")
-              << " BF16 tile-writeback drift versus FP32 accumulation: "
-              << "max_abs=" << accumulation_drift_max_abs
-              << ", nrmse=" << accumulation_drift_nrmse << '\n';
+              << " INT8-model verification: max_abs=" << max_abs
+              << ", max_rel=" << max_rel << ", nrmse=" << nrmse << '\n';
     const double native_nrmse =
         std::sqrt(native_squared_error / sample_count) /
         std::max(std::sqrt(native_squared_reference / sample_count), 1.0e-12);
     std::cout << (sampled ? "Sampled" : "Full")
-              << " dequantized-Q4_K BF16-FP32 reference: max_abs="
+              << " dequantized-Q4_K BF16-reference verification: max_abs="
               << native_max_abs << ", max_rel=" << native_max_rel
               << ", nrmse=" << native_nrmse << ", mismatches=" << native_errors
               << '\n';
   } else {
     std::cout << "WARNING: verification disabled\n";
   }
-  if (errors || fp32_errors || native_errors) {
-    std::cerr << "Failed with " << errors << " model, " << fp32_errors
-              << " BFP16-FP32, and " << native_errors
+  if (errors || native_errors) {
+    std::cerr << "Failed with " << errors << " INT8-model and " << native_errors
               << " native-reference mismatches\n";
     return 1;
   }

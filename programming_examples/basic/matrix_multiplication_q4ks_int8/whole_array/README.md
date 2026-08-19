@@ -9,13 +9,6 @@ The implementation is split into:
 - whole_array.py: JIT callable, whole-array schedules, direct runner, and
   verification/benchmark controls.
 - q4ks_bf16.cc: the smaller BF16-specialized Chess translation unit.
-- q4ks.cc: native BFP16, local-FP32, four-row cascade-FP32, and grouped
-  INT8-affine kernels.
-- benchmark_sweep.py: compute/cache/accumulation capacity and hardware
-  candidate selection.
+- q4ks.cc: native BFP16 and grouped INT8 affine kernels.
+- benchmark_sweep.py: capacity and hardware candidate selection.
 - tests/: host ABI/packing/TAP tests and NPU2 compile/run lit coverage.
-
-The selected ceiling path is native BFP with BF16 K-tile writeback and the
-`128/32 x 64 x 128` asymmetric tile. MemTile weight replay is executable but
-bounded to at most four row-block repeats per slab; see the parent README for
-the measured sustained results and `perf-*` targets.

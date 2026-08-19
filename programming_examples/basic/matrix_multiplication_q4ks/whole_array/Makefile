@@ -22,6 +22,7 @@ k?=64
 n?=128
 n_aie_cols?=8
 compute_type?=bfp16
+accumulation_mode?=bf16
 cache_mode?=l1-weight
 activation_input?=bf16
 
@@ -44,3 +45,60 @@ perf-bfp16-raw: iters=20
 perf-bfp16-raw: verify=false
 perf-bfp16-raw: min_gflops=12000
 perf-bfp16-raw: run
+
+# Stable name for the selected end-to-end ceiling candidate.  Put the device
+# in Turbo mode separately when measuring the absolute clock ceiling.
+.PHONY: perf-ceiling perf-ceiling-3x
+perf-ceiling: perf-bfp16
+
+perf-ceiling-3x:
+	python3 ${srcdir}/benchmark_sweep.py --hardware -M 4096 -K 4096 -N 4096 --compute-types bfp16 --accumulation-modes bf16 --cache-modes l1-weight --warmup 16 --iters 20 --rounds 3 --min-gflops 12000
+
+.PHONY: perf-fp32 perf-cascade perf-memtile
+perf-fp32: M=4096
+perf-fp32: K=4096
+perf-fp32: N=4096
+perf-fp32: m_c=128
+perf-fp32: m_a=32
+perf-fp32: k=64
+perf-fp32: n=32
+perf-fp32: compute_type=bfp16
+perf-fp32: accumulation_mode=fp32
+perf-fp32: cache_mode=l1-weight
+perf-fp32: warmup=16
+perf-fp32: iters=20
+perf-fp32: verify=true
+perf-fp32: min_gflops=5000
+perf-fp32: run
+
+perf-cascade: M=4096
+perf-cascade: K=4096
+perf-cascade: N=4096
+perf-cascade: m_c=64
+perf-cascade: m_a=64
+perf-cascade: k=64
+perf-cascade: n=64
+perf-cascade: compute_type=bfp16
+perf-cascade: accumulation_mode=cascade
+perf-cascade: cache_mode=l1-weight
+perf-cascade: warmup=16
+perf-cascade: iters=20
+perf-cascade: verify=true
+perf-cascade: min_gflops=7000
+perf-cascade: run
+
+perf-memtile: M=4096
+perf-memtile: K=4096
+perf-memtile: N=4096
+perf-memtile: m_c=128
+perf-memtile: m_a=32
+perf-memtile: k=64
+perf-memtile: n=128
+perf-memtile: compute_type=bfp16
+perf-memtile: accumulation_mode=bf16
+perf-memtile: cache_mode=memtile-weight
+perf-memtile: warmup=16
+perf-memtile: iters=20
+perf-memtile: verify=true
+perf-memtile: min_gflops=12000
+perf-memtile: run

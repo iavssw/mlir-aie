@@ -16,12 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from packing import (  # noqa: E402
-    ACCUMULATION_MODES,
-    CACHE_MODES,
-    COMPUTE_TYPES,
-    Q4KSConfig,
-)
+from packing import CACHE_MODES, COMPUTE_TYPES, Q4KSConfig  # noqa: E402
 
 
 def parser() -> argparse.ArgumentParser:
@@ -37,9 +32,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-gflops", type=float, default=0.0)
     result.add_argument("--full-verify", action="store_true")
     result.add_argument("--compute-types", nargs="+", choices=COMPUTE_TYPES)
-    result.add_argument(
-        "--accumulation-modes", nargs="+", choices=ACCUMULATION_MODES
-    )
     result.add_argument("--cache-modes", nargs="+", choices=CACHE_MODES)
     result.add_argument("--output-prefix", type=Path)
     return result
@@ -54,68 +46,18 @@ def candidates(opts) -> list[dict]:
     )
     atb = asymmetric if use_asymmetric else symmetric
     result = [
-        dict(
-            name="bf16-stream-symmetric",
-            compute_type="bf16",
-            cache_mode="stream",
-            **symmetric,
-        ),
-        dict(
-            name="bf16-l1-symmetric",
-            compute_type="bf16",
-            cache_mode="l1-weight",
-            **symmetric,
-        ),
-        dict(
-            name="bfp16-l1-atb",
-            compute_type="bfp16",
-            cache_mode="l1-weight",
-            **atb,
-        ),
-        dict(
-            name="bfp16-local-fp32",
-            compute_type="bfp16",
-            accumulation_mode="fp32",
-            cache_mode="l1-weight",
-            m_c=128,
-            m_a=32,
-            k=64,
-            n=32,
-        ),
-        dict(
-            name="bfp16-cascade-fp32",
-            compute_type="bfp16",
-            accumulation_mode="cascade",
-            cache_mode="l1-weight",
-            m_c=64,
-            m_a=64,
-            k=64,
-            n=64,
-        ),
-        dict(
-            name="int8-l1-atb",
-            compute_type="int8",
-            cache_mode="l1-weight",
-            **atb,
-        ),
-        dict(
-            name="bf16-memtile-q4",
-            compute_type="bf16",
-            cache_mode="memtile-weight",
-            **symmetric,
-        ),
+        dict(name="bf16-stream-symmetric", compute_type="bf16", cache_mode="stream", **symmetric),
+        dict(name="bf16-l1-symmetric", compute_type="bf16", cache_mode="l1-weight", **symmetric),
+        dict(name="bfp16-l1-atb", compute_type="bfp16", cache_mode="l1-weight", **atb),
+        dict(name="int8-l1-atb", compute_type="int8", cache_mode="l1-weight", **atb),
+        dict(name="bf16-memtile-q4", compute_type="bf16", cache_mode="memtile-weight", **symmetric),
         dict(
             name="bfp16-memtile-q4",
             compute_type="bfp16",
             cache_mode="memtile-weight",
-            **atb,
-        ),
-        dict(
-            name="int8-memtile-q4",
-            compute_type="int8",
-            cache_mode="memtile-weight",
             **symmetric,
         ),
+        dict(name="int8-memtile-q4", compute_type="int8", cache_mode="memtile-weight", **symmetric),
         dict(
             name="bfp16-preconverted-ceiling",
             compute_type="bfp16",
@@ -157,12 +99,6 @@ def candidates(opts) -> list[dict]:
     ]
     if opts.compute_types:
         result = [row for row in result if row["compute_type"] in opts.compute_types]
-    if opts.accumulation_modes:
-        result = [
-            row
-            for row in result
-            if row.get("accumulation_mode", "bf16") in opts.accumulation_modes
-        ]
     if opts.cache_modes:
         result = [row for row in result if row["cache_mode"] in opts.cache_modes]
     return result
@@ -187,10 +123,8 @@ def largest_joint_slab(opts, candidate) -> int | None:
                         "k",
                         "n",
                         "compute_type",
-                        "accumulation_mode",
                         "cache_mode",
                     )
-                    if key in candidate
                 },
             )
             return value
@@ -210,11 +144,7 @@ def config_for(opts, candidate) -> Q4KSConfig:
         n_aie_cols=opts.columns,
         activation_input=candidate.get("activation_input", "bf16"),
         cache_k=cache_k,
-        accumulation_mode=candidate.get("accumulation_mode", "bf16"),
-        **{
-            key: candidate[key]
-            for key in ("m_c", "m_a", "k", "n", "compute_type", "cache_mode")
-        },
+        **{key: candidate[key] for key in ("m_c", "m_a", "k", "n", "compute_type", "cache_mode")},
     )
 
 
@@ -227,7 +157,6 @@ def run_candidate(opts, candidate, cfg, result_path: Path) -> dict:
         "-k", str(cfg.k), "-n", str(cfg.n),
         "--n-aie-cols", str(cfg.n_aie_cols),
         "--compute-type", cfg.compute_type,
-        "--accumulation-mode", cfg.accumulation_mode,
         "--cache-mode", cfg.cache_mode,
         "--activation-input", cfg.activation_input,
         "--cache-k", str(cfg.cache_k),
@@ -270,7 +199,6 @@ def main() -> None:
     for candidate in candidates(opts):
         base = dict(candidate)
         base.setdefault("activation_input", "bf16")
-        base.setdefault("accumulation_mode", "bf16")
         try:
             cfg = config_for(opts, candidate)
             base.update(

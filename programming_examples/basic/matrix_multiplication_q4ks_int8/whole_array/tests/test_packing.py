@@ -272,49 +272,6 @@ class PreparedLayoutTests(unittest.TestCase):
         )
         self.assertLessEqual(sum(joint.memtile_components().values()), 512 * 1024)
 
-    def test_accumulation_memory_and_cascade_program_limit(self):
-        local_fp32 = Q4KSConfig(
-            M=512,
-            K=256,
-            N=512,
-            m_c=64,
-            m_a=32,
-            k=64,
-            n=32,
-            n_aie_cols=8,
-            compute_type="bfp16",
-            accumulation_mode="fp32",
-        )
-        self.assertIn(
-            "FP32 accumulation scratch", local_fp32.core_memory_components
-        )
-        cascade = Q4KSConfig(
-            M=512,
-            K=256,
-            N=512,
-            m_c=64,
-            m_a=64,
-            k=64,
-            n=64,
-            n_aie_cols=8,
-            compute_type="bfp16",
-            accumulation_mode="cascade",
-        )
-        self.assertEqual(cascade.a_fifo_depth, 2)
-        with self.assertRaisesRegex(ValueError, "program memory"):
-            Q4KSConfig(
-                M=512,
-                K=512,
-                N=512,
-                m_c=64,
-                m_a=64,
-                k=128,
-                n=64,
-                n_aie_cols=8,
-                compute_type="bfp16",
-                accumulation_mode="cascade",
-            )
-
 
 class ComputeReferenceTests(unittest.TestCase):
     def test_int8_activation_contract_and_reference(self):

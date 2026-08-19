@@ -12,7 +12,7 @@ and graph/backend integration are intentionally out of scope.
 
 The same whole-array graph exposes three Chess kernels:
 
-| compute type | weight path | activation path | accumulation |
+| compute type | weight path | activation path | matrix operation |
 |---|---|---|---|
 | bf16 | Q4_K affine dequant to BF16 L1 scratch | BF16 | emulated BF16/BFP16 MMUL |
 | bfp16 | affine dequant directly to bfp16ebs8 L1 scratch | BF16 converted to BFP16 | native BFP16 accfloat |
@@ -21,14 +21,34 @@ The same whole-array graph exposes three Chess kernels:
 All paths produce BF16. The kernel receives an explicit A-subtile index,
 dequantizes B only for subtile zero, and has no mutable call counter.
 
+Native BFP16 has three accumulation modes:
+
+| mode | behavior |
+|---|---|
+| bf16 | accumulate a 64-K tile in `accfloat`, then write/read BF16 between K tiles |
+| fp32 | retain the whole output tile in local FP32 scratch and convert to BF16 only once |
+| cascade | split K over four AIE rows, pass `accfloat` values over cascade streams, retain the completed sum in FP32, then write BF16 |
+
+The cascade specialization is intentionally limited to `k=64`. A `k=128`
+experiment fit data memory but overflowed AIE program memory for its three
+fully scheduled cascade roles, so validation rejects it before compilation.
+
+There are not separate BFP and BF16 matrix engines to run concurrently. Chess
+lowers both the native-BFP path and the BF16-emulation path to the same
+`VMAC.f` matrix slot. In the selected kernel, BF16 A loads/conversion, BFP
+block loads, and `VMAC.f` already co-issue in one VLIW packet. Preconverting A
+to BFP moved both operands onto the block-load path and reduced throughput.
+
 Three cache modes are executable:
 
 - stream: compressed Q4 tiles use the baseline whole-array schedule.
 - l1-weight: labels the asymmetric-tile experiment; one dequantized B tile
   is retained while all mC/mA A subtiles are processed.
 - memtile-weight: uses an N-panel-outer schedule, loads one compressed
-  full-K panel per column, and replays its K tiles for every M row block with
-  ObjectFifo.repeat_count.
+  full-K panel per column, and replays its K tiles with ObjectFifo.repeat_count.
+  Hardware replay is bounded to the largest row-slab divisor no greater than
+  four. Eight replays compile but stall on this NPU2; at 4096 cubed, two
+  four-row slabs retain 4x compressed-weight reuse without that deadlock.
 
 memtile-activation and joint-slab are represented by exact capacity models
 and the sweep table, but are intentionally rejected by device compilation:
@@ -101,14 +121,53 @@ To run the correctness-qualified default with 16 warmups, 20 timed iterations,
 sampled Q4_K verification, and a 12,000-GFLOP/s gate, use:
 
 ~~~bash
-make perf-bfp16
+make perf-ceiling
 ~~~
 
-On the local NPU2, the full 16-warmup/20-iteration target measured 16.19
-TFLOP/s average (15.64--16.65 TFLOP/s over the timed iterations). Sampled
-verification passed with maximum absolute error 0.078125 and normalized RMSE
-0.02077. `make perf-bfp16-raw` remains available only as an explicitly
-unverified diagnostic.
+`make perf-bfp16` is an alias for the same selected path. The explicitly
+unverified `make perf-bfp16-raw` target is only a throughput diagnostic.
+
+### Measured ceiling and accuracy tradeoff
+
+The following measurements use the local eight-column Krackan NPU in XRT
+`Default` power mode. Throughput is end to end on the NPU and includes
+compressed-panel loads, in-execution Q4_K dequantization, activation
+conversion, matrix work, accumulation traffic, and BF16 output conversion.
+Host Q4_K preparation is model-load work and is excluded.
+
+| path | 4096-cubed throughput | BFP/FP32-reference NRMSE | direct-Q4_K-reference NRMSE |
+|---|---:|---:|---:|
+| native BFP, BF16 K-tile writeback, L1 reuse | **16.472 TOPS median round-average** | 0.01919 | 0.01381 |
+| native BFP, bounded MemTile weight replay | 12.588 TOPS average | 0.01919 | 0.01381 |
+| native BFP, local FP32 accumulation | 5.693 TOPS average | 0.01637 | 0.00991 |
+| native BFP, four-row cascade FP32 | 7.681 TOPS average | 0.01637 | 0.00991 |
+| native BFP, 256/32 x 64 x 64 reuse tile | 7.060 TOPS average | 0.01919 | 0.01381 |
+
+The selected path was run for three rounds of 16 warmups plus 20 timed
+iterations. Round averages were 16.504, 16.472, and 16.190 TOPS; the complete
+timed range was 15.283--16.930 TOPS. Sampled checks passed with maximum
+absolute error 0.078125. The C++ verifier also reports BF16 K-tile writeback
+drift directly against the same BFP computation accumulated in FP32; the
+measured drift was max-absolute 0.0390625 and NRMSE 0.0086545.
+
+The result is matrix-issue bound, not compressed-weight bandwidth bound:
+MemTile caching reduces weight ingress but adds sustained replay/synchronizing
+bubbles. Short one-iteration MemTile results reached 16.03 TOPS, but the
+16/20 sustained average is the 12.588-TOPS number above.
+
+For the absolute clock ceiling, first select Turbo mode in another terminal;
+this needs administrator permission and is deliberately not changed by Make:
+
+~~~bash
+xrt-smi examine --report platform
+sudo xrt-smi configure --pmode turbo
+make perf-ceiling-3x
+sudo xrt-smi configure --pmode default
+~~~
+
+Always record the reported power mode with a ceiling number. The table above
+intentionally contains only Default-mode measurements; Turbo requires an
+interactive administrator-authorized device-state change.
 
 A small full-verification run is:
 
@@ -137,6 +196,18 @@ Select another candidate with Make variables:
 ~~~bash
 make run M=1024 K=256 N=1024 m_c=128 m_a=32 k=64 n=128 compute_type=bfp16 cache_mode=l1-weight
 ~~~
+
+The stable comparison targets use the exact configurations from the table:
+
+~~~bash
+make perf-fp32
+make perf-cascade
+make perf-memtile
+~~~
+
+All retain BF16 host activations and BF16 output. `perf-fp32` keeps one local
+FP32 C tile across K; `perf-cascade` passes intermediate `accfloat` values
+between rows; `perf-memtile` exercises bounded compressed-panel replay.
 
 Trace builds use a separate four-column diagnostic configuration because a
 spare shim column is required:

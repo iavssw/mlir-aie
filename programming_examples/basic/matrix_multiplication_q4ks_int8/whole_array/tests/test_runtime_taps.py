@@ -44,49 +44,6 @@ class RuntimeTapTests(unittest.TestCase):
         self.assertEqual(len(b), 8)
         self.assertEqual([tap.offset for tap in b], [i * 10240 for i in range(8)])
 
-    def test_large_memtile_weight_uses_bounded_replay_slabs(self):
-        a, b, c = generate_taps(
-            M=4096,
-            K=256,
-            N=1024,
-            m_c=128,
-            m_a=32,
-            k=64,
-            n=128,
-            n_aie_cols=8,
-            compute_type="bfp16",
-            accumulation_mode="bf16",
-            cache_mode="memtile-weight",
-            activation_input="bf16",
-            cache_k=256,
-        )
-        np.testing.assert_array_equal(a.access_count(), np.ones((4096, 256)))
-        np.testing.assert_array_equal(
-            b.access_count().ravel(), np.full((163840,), 2)
-        )
-        np.testing.assert_array_equal(c.access_count(), np.ones((4096, 1024)))
-        self.assertEqual(len(b), 16)
-
-    def test_large_c_join_is_split_below_dma_limit(self):
-        _, _, c = generate_taps(
-            M=4096,
-            K=256,
-            N=512,
-            m_c=256,
-            m_a=32,
-            k=64,
-            n=64,
-            n_aie_cols=8,
-            compute_type="bfp16",
-            accumulation_mode="bf16",
-            cache_mode="l1-weight",
-            activation_input="bf16",
-            cache_k=256,
-        )
-        np.testing.assert_array_equal(c.access_count(), np.ones((4096, 512)))
-        for tap in c:
-            self.assertLessEqual(max(tap.sizes), 1023)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,7 +67,6 @@ struct Layout {
   int n = 64;
   int n_aie_cols = 8;
   std::string compute_type = "bf16";
-  std::string accumulation_mode = "bf16";
   std::string cache_mode = "stream";
   int cache_k = 1024;
 
@@ -90,14 +89,9 @@ struct Layout {
     return static_cast<std::size_t>(K / k) * (N / n) * tile_bytes();
   }
   int c_depth() const { return m_c >= 128 ? 1 : 2; }
-  int a_depth() const {
-    if (accumulation_mode == "cascade")
-      return 2;
-    return m_a >= 64 ? 1 : 2;
-  }
+
   std::size_t core_memory_bytes() const {
-    const std::size_t a_fifo =
-        static_cast<std::size_t>(a_depth()) * m_a * k * 2;
+    const std::size_t a_fifo = 2ULL * static_cast<std::size_t>(m_a) * k * 2;
     const std::size_t b_fifo = tile_bytes();
     const std::size_t c_fifo =
         static_cast<std::size_t>(c_depth()) * m_c * n * 2;
@@ -105,17 +99,14 @@ struct Layout {
     std::size_t activation_scratch = 0;
     if (compute_type == "bfp16") {
       weight_scratch = static_cast<std::size_t>(k) * n * 9 / 8;
+      activation_scratch = static_cast<std::size_t>(m_a) * k * 9 / 8;
     } else if (compute_type == "int8") {
       weight_scratch = static_cast<std::size_t>(k) * n;
       activation_scratch = static_cast<std::size_t>(m_a) * k +
                            static_cast<std::size_t>(m_a) * (k / 32) * 6;
     }
-    const std::size_t fp32_scratch =
-        accumulation_mode == "fp32" || accumulation_mode == "cascade"
-            ? static_cast<std::size_t>(m_c) * n * 4
-            : 0;
     return a_fifo + b_fifo + c_fifo + weight_scratch + activation_scratch +
-           fp32_scratch + 0xD00 + 4 * 1024;
+           0xD00 + 4 * 1024;
   }
 
   std::size_t memtile_bytes() const {
@@ -149,27 +140,6 @@ struct Layout {
     if (compute_type != "bf16" && compute_type != "bfp16" &&
         compute_type != "int8")
       throw std::invalid_argument("compute type must be bf16, bfp16, or int8");
-    if (accumulation_mode != "bf16" && accumulation_mode != "fp32" &&
-        accumulation_mode != "cascade")
-      throw std::invalid_argument(
-          "accumulation mode must be bf16, fp32, or cascade");
-    if (accumulation_mode != "bf16" && compute_type != "bfp16")
-      throw std::invalid_argument(
-          "FP32 and cascade accumulation require bfp16 compute");
-    if (accumulation_mode == "cascade") {
-      if (m_a != m_c)
-        throw std::invalid_argument("cascade accumulation requires m_a == m_c");
-      if (k != 64)
-        throw std::invalid_argument(
-            "cascade accumulation currently requires k == 64; larger "
-            "specializations exceed AIE program memory");
-      if (K % (n_aie_rows * k))
-        throw std::invalid_argument(
-            "cascade accumulation requires 4*k to divide K");
-      if (cache_mode != "stream" && cache_mode != "l1-weight")
-        throw std::invalid_argument(
-            "cascade accumulation supports stream or l1-weight");
-    }
     if (cache_mode != "stream" && cache_mode != "l1-weight" &&
         cache_mode != "memtile-weight")
       throw std::invalid_argument(
@@ -178,10 +148,8 @@ struct Layout {
       throw std::invalid_argument("cache_k must be a 256-aligned divisor of K");
     if (cache_mode == "memtile-weight" && cache_k != K)
       throw std::invalid_argument("memtile-weight requires cache_k == K");
-    if (packed_rows() > 1023 ||
-        (accumulation_mode == "cascade" && n_aie_rows * packed_rows() > 1023) ||
-        K / k > 1023 || N / (n * n_aie_cols) > 1023 || k > 1023 || m_a > 1023 ||
-        m_c > 1023 || n > 1023)
+    if (packed_rows() > 1023 || K / k > 1023 || N / (n * n_aie_cols) > 1023 ||
+        k > 1023 || m_a > 1023 || m_c > 1023 || n > 1023)
       throw std::invalid_argument("DMA size exceeds the 10-bit limit");
     if (core_memory_bytes() > 64 * 1024)
       throw std::invalid_argument("configuration exceeds 64-KiB core memory");
@@ -482,10 +450,10 @@ inline void round_bfp16ebs8(const float input[8], float output[8]) {
 }
 
 inline float reference_value(const Layout &layout, const Inputs &inputs,
-                             const Decoded &decoded, int row, int col,
-                             bool round_tile_partials = true) {
-  float accumulator = 0.0f;
+                             const Decoded &decoded, int row, int col) {
+  float stored = 0.0f;
   for (int kt = 0; kt < layout.K; kt += layout.k) {
+    float accumulator = stored;
     for (int group0 = kt; group0 < kt + layout.k; group0 += group_size) {
       const auto parameter =
           static_cast<std::size_t>(group0 / group_size) * layout.N + col;
@@ -542,10 +510,9 @@ inline float reference_value(const Layout &layout, const Inputs &inputs,
         }
       }
     }
-    if (round_tile_partials)
-      accumulator = as_float(as_bf16(accumulator));
+    stored = as_float(as_bf16(accumulator));
   }
-  return as_float(as_bf16(accumulator));
+  return stored;
 }
 
 inline bool close(float actual, float expected, float atol = 0.5f,

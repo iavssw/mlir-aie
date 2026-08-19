@@ -16,8 +16,6 @@ import aie.iron as iron
 import numpy as np
 from aie.helpers.taplib import TensorAccessPattern, TensorAccessSequence, TensorTiler2D
 from aie.iron import (
-    Buffer,
-    CascadeFlow,
     CompileTime,
     In,
     Kernel,
@@ -30,8 +28,7 @@ from aie.iron import (
     Worker,
 )
 from aie.iron.controlflow import range_
-from aie.iron.device import Tile, from_name
-from aie.iron.dataflow import ObjectFifoLink
+from aie.iron.device import from_name
 from aie.iron.kernel import ExternalFunction
 from aie.utils import config as aie_config
 from aie.utils.benchmark import BenchmarkResult, run_iters
@@ -46,7 +43,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from packing import (  # noqa: E402
-    ACCUMULATION_MODES,
     ACTIVATION_INPUTS,
     CACHE_MODES,
     COMPUTE_TYPES,
@@ -81,7 +77,7 @@ def _device_for(dev: str, columns: int):
     return device
 
 
-def _kernels(config: Q4KSConfig, a_ty, b_ty, c_ty, accumulator_ty=None):
+def _kernels(config: Q4KSConfig, a_ty, b_ty, c_ty):
     name = (
         f"q4ks_{config.compute_type}_{config.m_c}x{config.k}x{config.n}"
         f"_a{config.m_a}.o"
@@ -97,332 +93,17 @@ def _kernels(config: Q4KSConfig, a_ty, b_ty, c_ty, accumulator_ty=None):
     ]
     if config.compute_type == "bf16":
         flags.append("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16")
-    if config.accumulation_mode == "fp32":
-        flags.append("-DACCUM_FP32")
-    symbol = (
-        "q4ks_matmul_bfp16_fp32"
-        if config.accumulation_mode == "fp32"
-        else f"q4ks_matmul_{config.compute_type}"
-    )
-    matmul_c_ty = accumulator_ty if config.accumulation_mode == "fp32" else c_ty
     matmul = ExternalFunction(
-        symbol,
+        f"q4ks_matmul_{config.compute_type}",
         object_file_name=name,
         source_file=KERNEL_SOURCES[config.compute_type],
-        arg_types=[a_ty, b_ty, matmul_c_ty, np.int32],
+        arg_types=[a_ty, b_ty, c_ty, np.int32],
         include_dirs=[aie_config.cxx_header_path(), AIE_KERNEL_INCLUDE],
         compile_flags=flags,
         use_chess=True,
     )
-    if config.accumulation_mode == "fp32":
-        zero = Kernel("q4ks_zero_f32", matmul.object_file_name, [accumulator_ty])
-        store = Kernel(
-            "q4ks_store_bf16", matmul.object_file_name, [accumulator_ty, c_ty]
-        )
-    else:
-        zero = Kernel("q4ks_zero_bf16", matmul.object_file_name, [c_ty])
-        store = None
-    return matmul, zero, store
-
-
-def _cascade_kernels(config: Q4KSConfig, a_ty, b_ty, c_ty, accumulator_ty):
-    name = f"q4ks_bfp16_cascade_{config.m_c}x{config.k}x{config.n}.o"
-    flags = [
-        f"-DDIM_M_C={config.m_c}",
-        f"-DDIM_M_A={config.m_a}",
-        f"-DDIM_K={config.k}",
-        f"-DDIM_N={config.n}",
-        f"-DPACKED_TILE_BYTES={config.tile_bytes}",
-        "-DCOMPUTE_BFP16",
-        "-DACCUM_CASCADE",
-        f"-I{AIE_KERNEL_INCLUDE}",
-    ]
-    put_only = ExternalFunction(
-        "q4ks_cascade_put_only",
-        object_file_name=name,
-        source_file=KERNEL_SOURCES["bfp16"],
-        arg_types=[a_ty, b_ty],
-        include_dirs=[aie_config.cxx_header_path(), AIE_KERNEL_INCLUDE],
-        compile_flags=flags,
-        use_chess=True,
-    )
-    put_get = Kernel("q4ks_cascade_put_get", name, [a_ty, b_ty])
-    get_only = Kernel(
-        "q4ks_cascade_get_only", name, [a_ty, b_ty, accumulator_ty]
-    )
-    zero = Kernel("q4ks_zero_f32", name, [accumulator_ty])
-    store = Kernel("q4ks_store_bf16", name, [accumulator_ty, c_ty])
-    return put_only, put_get, get_only, zero, store
-
-
-def _build_cascade_design(
-    dev,
-    config: Q4KSConfig,
-    trace_config: TraceConfig | None,
-    *,
-    generate_taps: bool = False,
-):
-    """Split K over four rows and retain completed row-group sums in FP32."""
-
-    M, K, N = config.M, config.K, config.N
-    m, k, n = config.m_c, config.k, config.n
-    n_cols = config.n_aie_cols
-    cascade_rounds = K // (N_AIE_ROWS * k)
-    n_rounds = N // (n * n_cols)
-    output_tiles_per_column = (M // m) * n_rounds
-
-    A_ty = np.ndarray[(M * K,), np.dtype[bfloat16]]
-    B_ty = np.ndarray[(config.prepared_bytes,), np.dtype[np.uint8]]
-    C_ty = np.ndarray[(M * N,), np.dtype[bfloat16]]
-    A_l2_ty = np.ndarray[(m, k), np.dtype[bfloat16]]
-    A_l1_ty = np.ndarray[(m, k), np.dtype[bfloat16]]
-    B_l2_ty = np.ndarray[
-        (N_AIE_ROWS * config.packed_rows, k), np.dtype[np.uint8]
-    ]
-    B_l1_ty = np.ndarray[(config.packed_rows, k), np.dtype[np.uint8]]
-    C_l1_ty = np.ndarray[(m, n), np.dtype[bfloat16]]
-    C_l2_ty = np.ndarray[(m, n), np.dtype[bfloat16]]
-    accumulator_ty = np.ndarray[(m * n,), np.dtype[np.float32]]
-
-    kernel_a_ty = np.ndarray[(m * k,), np.dtype[bfloat16]]
-    kernel_b_ty = np.ndarray[(config.tile_bytes,), np.dtype[np.uint8]]
-    kernel_c_ty = np.ndarray[(m * n,), np.dtype[bfloat16]]
-    put_only, put_get, get_only, zero, store = _cascade_kernels(
-        config, kernel_a_ty, kernel_b_ty, kernel_c_ty, accumulator_ty
-    )
-
-    a_to_stream: StreamDims = [
-        (k // 8, 8),
-        (m, k),
-        (8, 1),
-    ]
-    a_from_stream: StreamDims = [
-        (k // 8, 64),
-        (m // 8, 8 * k),
-        (64, 1),
-    ]
-    A_l3l2: list[ObjectFifo] = []
-    A_l2l1: list[ObjectFifo] = []
-    for row in range(N_AIE_ROWS):
-        parent = ObjectFifo(A_l2_ty, name=f"A_CASCADE_L3L2_{row}", depth=2)
-        child = parent.cons().forward(
-            tile=Tile(row, 1),
-            obj_type=A_l1_ty,
-            depth=config.a_fifo_depth,
-            name=f"A_CASCADE_L2L1_{row}",
-            dims_to_stream=a_to_stream,
-            dims_from_stream=a_from_stream,
-        )
-        A_l3l2.append(parent)
-        A_l2l1.append(child)
-
-    B_l3l2: list[ObjectFifo] = []
-    B_l2l1: list[list[ObjectFifo]] = [[] for _ in range(N_AIE_ROWS)]
-    for col in range(n_cols):
-        parent = ObjectFifo(B_l2_ty, name=f"B_CASCADE_L3L2_{col}", depth=2)
-        children = parent.cons().split(
-            [row * config.tile_bytes for row in range(N_AIE_ROWS)],
-            tile=Tile(col, 1),
-            obj_types=[B_l1_ty] * N_AIE_ROWS,
-            depths=[1] * N_AIE_ROWS,
-            names=[f"B_CASCADE_L2L1_{col}_{row}" for row in range(N_AIE_ROWS)],
-        )
-        B_l3l2.append(parent)
-        for row in range(N_AIE_ROWS):
-            B_l2l1[row].append(children[row])
-
-    c_dims: StreamDims = [
-        (m // 8, 8 * n),
-        (8, 8),
-        (n // 8, 64),
-        (8, 1),
-    ]
-    C_l1l2: list[ObjectFifo] = []
-    C_l2l3: list[ObjectFifo] = []
-    for col in range(n_cols):
-        child = ObjectFifo(
-            C_l1_ty, name=f"C_CASCADE_L1L2_{col}", depth=config.c_fifo_depth
-        )
-        parent = child.cons().forward(
-            tile=Tile(col, 1),
-            obj_type=C_l2_ty,
-            depth=config.c_fifo_depth,
-            name=f"C_CASCADE_L2L3_{col}",
-            dims_to_stream=c_dims,
-        )
-        C_l1l2.append(child)
-        C_l2l3.append(parent)
-
-    def top_fn(in_a, in_b, out_c, accumulator, zero_fn, get_fn, store_fn):
-        tile_loop = (
-            range_(output_tiles_per_column)
-            if output_tiles_per_column > 1
-            else range(1)
-        )
-        for _ in tile_loop:
-            elem_c = out_c.acquire(1)
-            zero_fn(accumulator)
-            rounds = range_(cascade_rounds) if cascade_rounds > 1 else range(1)
-            for _ in rounds:
-                elem_a = in_a.acquire(1)
-                elem_b = in_b.acquire(1)
-                get_fn(elem_a, elem_b, accumulator)
-                in_a.release(1)
-                in_b.release(1)
-            store_fn(accumulator, elem_c)
-            out_c.release(1)
-
-    def middle_fn(in_a, in_b, put_get_fn):
-        tile_loop = (
-            range_(output_tiles_per_column)
-            if output_tiles_per_column > 1
-            else range(1)
-        )
-        for _ in tile_loop:
-            rounds = range_(cascade_rounds) if cascade_rounds > 1 else range(1)
-            for _ in rounds:
-                elem_a = in_a.acquire(1)
-                elem_b = in_b.acquire(1)
-                put_get_fn(elem_a, elem_b)
-                in_a.release(1)
-                in_b.release(1)
-
-    def bottom_fn(in_a, in_b, put_only_fn):
-        tile_loop = (
-            range_(output_tiles_per_column)
-            if output_tiles_per_column > 1
-            else range(1)
-        )
-        for _ in tile_loop:
-            rounds = range_(cascade_rounds) if cascade_rounds > 1 else range(1)
-            for _ in rounds:
-                elem_a = in_a.acquire(1)
-                elem_b = in_b.acquire(1)
-                put_only_fn(elem_a, elem_b)
-                in_a.release(1)
-                in_b.release(1)
-
-    workers: list[list[Worker]] = [[] for _ in range(N_AIE_ROWS)]
-    for col in range(n_cols):
-        accumulator = Buffer(accumulator_ty, name=f"C_CASCADE_ACC_{col}")
-        workers[0].append(
-            Worker(
-                top_fn,
-                [
-                    A_l2l1[0].cons(),
-                    B_l2l1[0][col].cons(),
-                    C_l1l2[col].prod(),
-                    accumulator,
-                    zero,
-                    get_only,
-                    store,
-                ],
-                tile=Tile(col, 2),
-                stack_size=0xD00,
-                trace=1 if trace_config and col == 1 else 0,
-            )
-        )
-        for row in (1, 2):
-            workers[row].append(
-                Worker(
-                    middle_fn,
-                    [
-                        A_l2l1[row].cons(),
-                        B_l2l1[row][col].cons(),
-                        put_get,
-                    ],
-                    tile=Tile(col, row + 2),
-                    stack_size=0xD00,
-                )
-            )
-        workers[3].append(
-            Worker(
-                bottom_fn,
-                [A_l2l1[3].cons(), B_l2l1[3][col].cons(), put_only],
-                tile=Tile(col, 5),
-                stack_size=0xD00,
-            )
-        )
-
-    for col in range(n_cols):
-        for row in range(N_AIE_ROWS - 1, 0, -1):
-            CascadeFlow(workers[row][col], workers[row - 1][col])
-    flat_workers = [worker for row in workers for worker in row]
-
-    A_prods = [fifo.prod(tile=Tile(row, 0)) for row, fifo in enumerate(A_l3l2)]
-    B_prods = [fifo.prod(tile=Tile(col, 0)) for col, fifo in enumerate(B_l3l2)]
-    C_conses = [fifo.cons(tile=Tile(col, 0)) for col, fifo in enumerate(C_l2l3)]
-    A_taps: list[TensorAccessPattern] = []
-    B_taps: list[TensorAccessPattern] = []
-    C_taps: list[TensorAccessPattern] = []
-    n_k_tiles = K // k
-    bytes_per_column = n_rounds * n_k_tiles * config.tile_bytes
-
-    def sequence(A, B, C, A_hs, B_hs, C_hs):
-        for row_base in range(0, M // m, 2):
-            row_count = min(2, M // m - row_base)
-            task_group = TaskGroup()
-            for tile_row in range(row_count):
-                m_tile = row_base + tile_row
-                for row in range(N_AIE_ROWS):
-                    a_tap = TensorAccessPattern(
-                        (M, K),
-                        offset=m_tile * m * K + row * k,
-                        sizes=[n_rounds, cascade_rounds, m, k],
-                        strides=[0, N_AIE_ROWS * k, K, 1],
-                    )
-                    A_hs[row].fill(A, tap=a_tap, group=task_group)
-                    A_taps.append(a_tap)
-            for col in range(n_cols):
-                c_tap = TensorAccessPattern(
-                    (M, N),
-                    offset=row_base * m * N + col * n,
-                    sizes=[row_count, n_rounds, m, n],
-                    strides=[m * N, n * n_cols, N, 1],
-                )
-                C_hs[col].drain(C, tap=c_tap, wait=True, group=task_group)
-                C_taps.append(c_tap)
-                for tile_row in range(row_count):
-                    b_tap = TensorAccessPattern(
-                        (config.prepared_bytes,),
-                        offset=col * bytes_per_column,
-                        sizes=[
-                            n_rounds,
-                            cascade_rounds,
-                            N_AIE_ROWS * config.packed_rows,
-                            k,
-                        ],
-                        strides=[
-                            n_k_tiles * config.tile_bytes,
-                            N_AIE_ROWS * config.tile_bytes,
-                            k,
-                            1,
-                        ],
-                    )
-                    B_hs[col].fill(B, tap=b_tap, group=task_group)
-                    B_taps.append(b_tap)
-            task_group.finish()
-
-    runtime = Runtime(
-        sequence, [A_ty, B_ty, C_ty, A_prods, B_prods, C_conses]
-    )
-    program = Program(dev, runtime, workers=flat_workers)
-    if trace_config:
-        if n_cols == 8:
-            raise ValueError("trace requires a spare shim column; use fewer than 8 columns")
-        program.enable_trace(
-            trace_config.trace_size,
-            workers=[workers[0][1]],
-            egress_shim_col=n_cols,
-        )
-    module = program.resolve_program()
-    if generate_taps:
-        return (
-            TensorAccessSequence.from_taps(A_taps),
-            TensorAccessSequence.from_taps(B_taps),
-            TensorAccessSequence.from_taps(C_taps),
-        )
-    return module
+    zero = Kernel("q4ks_zero_bf16", matmul.object_file_name, [c_ty])
+    return matmul, zero
 
 
 def _build_design(
@@ -436,7 +117,6 @@ def _build_design(
     n: int,
     n_aie_cols: int,
     compute_type: str,
-    accumulation_mode: str,
     cache_mode: str,
     activation_input: str,
     cache_k: int,
@@ -456,15 +136,10 @@ def _build_design(
         n=n,
         n_aie_cols=n_aie_cols,
         compute_type=compute_type,
-        accumulation_mode=accumulation_mode,
         cache_mode=cache_mode,
         activation_input=activation_input,
         cache_k=cache_k,
     )
-    if accumulation_mode == "cascade":
-        return _build_cascade_design(
-            dev, config, trace_config, generate_taps=generate_taps
-        )
     # Activation and joint caching require the converter-worker graph.  Keep
     # those modes visible to the capacity/sweep tools, but never silently
     # compile them as the streaming schedule.
@@ -481,15 +156,6 @@ def _build_design(
     n_cores = N_AIE_ROWS * n_aie_cols
     n_tiles_per_core = (M // m_c) * (N // n) // n_cores
     n_row_blocks = M // m_c // N_AIE_ROWS
-    # Eight hardware replays currently stall on NPU2.  Counts through four
-    # are validated, so larger M dimensions use multiple replay slabs.  A
-    # divisor gives every producer object the one static repeat count required
-    # by ObjectFifo lowering.
-    memtile_replay_rows = next(
-        replay
-        for replay in range(min(4, n_row_blocks), 0, -1)
-        if n_row_blocks % replay == 0
-    )
     n_shim_a = min(N_AIE_ROWS, n_aie_cols)
     a_rows_per_shim = N_AIE_ROWS // n_aie_cols if n_aie_cols < 4 else 1
 
@@ -510,14 +176,7 @@ def _build_design(
     kernel_a_ty = np.ndarray[(m_a * k,), np.dtype[bfloat16]]
     kernel_b_ty = np.ndarray[(config.tile_bytes,), np.dtype[np.uint8]]
     kernel_c_ty = np.ndarray[(m_c * n,), np.dtype[bfloat16]]
-    accumulator_ty = (
-        np.ndarray[(m_c * n,), np.dtype[np.float32]]
-        if accumulation_mode == "fp32"
-        else None
-    )
-    matmul_kernel, zero_kernel, store_kernel = _kernels(
-        config, kernel_a_ty, kernel_b_ty, kernel_c_ty, accumulator_ty
-    )
+    matmul_kernel, zero_kernel = _kernels(config, kernel_a_ty, kernel_b_ty, kernel_c_ty)
 
     A_l3l2: list[ObjectFifo] = []
     A_l2l1: list[ObjectFifo] = []
@@ -544,9 +203,9 @@ def _build_design(
         stop = start + a_rows_per_shim
         children = parent.cons().split(
             [m_c * k * row for row in range(a_rows_per_shim)],
+            depths=[2] * a_rows_per_shim,
             obj_types=[A_l1_ty] * a_rows_per_shim,
             names=[f"A_L2L1_{row}" for row in range(start, stop)],
-            depths=[config.a_fifo_depth] * a_rows_per_shim,
             dims_to_stream=[a_to_stream] * a_rows_per_shim,
             dims_from_stream=[a_from_stream] * a_rows_per_shim,
         )
@@ -565,28 +224,14 @@ def _build_design(
             depth=1 if cache_mode == "memtile-weight" else 2,
         )
         B_l3l2.append(parent_b)
-        if cache_mode == "memtile-weight":
-            # One producer object is the entire compressed full-K panel while
-            # each consumer acquisition is one packed Q4_K compute tile.  The
-            # repeat therefore applies to a panel (not to each K tile).  Large
-            # M dimensions reload the panel between bounded replay slabs.
-            child_b = ObjectFifo(
-                B_l2_ty,
-                consumer_obj_type=B_l1_ty,
-                depth=1,
-                repeat_count=memtile_replay_rows,
-                name=f"B_L2L1_{col}",
-            )
-            ObjectFifoLink(
-                parent_b.cons(), child_b.prod(), tile=Tile(col, 1)
-            )
-        else:
-            child_b = parent_b.cons().forward(
+        B_l2l1.append(
+            parent_b.cons().forward(
                 obj_type=B_l1_ty,
                 depth=1,
                 name=f"B_L2L1_{col}",
+                repeat_count=n_row_blocks if cache_mode == "memtile-weight" else None,
             )
-        B_l2l1.append(child_b)
+        )
         parent_c = ObjectFifo(
             C_l2_ty,
             name=f"C_L2L3_{col}",
@@ -618,48 +263,22 @@ def _build_design(
                 in_b.release(1)
             out_c.release(1)
 
-    def core_fn_fp32(in_a, in_b, out_c, accumulator, zero, matmul, store):
-        tile_loop = range_(n_tiles_per_core) if n_tiles_per_core > 1 else range(1)
-        for _ in tile_loop:
-            elem_c = out_c.acquire(1)
-            zero(accumulator)
-            k_loop = range_(K // k) if K // k > 1 else range(1)
-            for _ in k_loop:
-                elem_b = in_b.acquire(1)
-                for subtile in range(config.a_subtiles):
-                    elem_a = in_a.acquire(1)
-                    matmul(elem_a, elem_b, accumulator, subtile)
-                    in_a.release(1)
-                in_b.release(1)
-            store(accumulator, elem_c)
-            out_c.release(1)
-
-    def make_worker(row, col):
-        common = [
-            A_l2l1[row].cons(),
-            B_l2l1[col].cons(),
-            C_l1l2[row][col].prod(),
-        ]
-        trace = 1 if trace_config and row * n_aie_cols + col == 1 else 0
-        if accumulation_mode == "fp32":
-            accumulator = Buffer(
-                accumulator_ty, name=f"C_accumulator_{row}_{col}"
-            )
-            return Worker(
-                core_fn_fp32,
-                common
-                + [accumulator, zero_kernel, matmul_kernel, store_kernel],
-                stack_size=0xD00,
-                trace=trace,
-            )
-        return Worker(
+    workers = Worker.grid(
+        N_AIE_ROWS,
+        n_aie_cols,
+        lambda row, col: Worker(
             core_fn,
-            common + [zero_kernel, matmul_kernel],
+            [
+                A_l2l1[row].cons(),
+                B_l2l1[col].cons(),
+                C_l1l2[row][col].prod(),
+                zero_kernel,
+                matmul_kernel,
+            ],
             stack_size=0xD00,
-            trace=trace,
-        )
-
-    workers = Worker.grid(N_AIE_ROWS, n_aie_cols, make_worker)
+            trace=1 if trace_config and row * n_aie_cols + col == 1 else 0,
+        ),
+    )
     flat_workers = [worker for row in workers for worker in row]
 
     A_tiles = TensorTiler2D.group_tiler(
@@ -710,87 +329,63 @@ def _build_design(
 
     def sequence(A, B, C, A_hs, B_hs, C_hs):
         if cache_mode == "memtile-weight":
+            task_group = TaskGroup()
             tiles_per_col = config.n_n_tiles // n_aie_cols
             for n_round in range(tiles_per_col):
-                for slab_base in range(0, n_row_blocks, memtile_replay_rows):
-                    task_group = TaskGroup()
-                    # Load each full-K compressed panel once per bounded slab;
-                    # the MemTile DMA replays its K descriptors for each row.
+                # Load each full-K compressed panel once.  The MemTile DMA
+                # replays its K-tile descriptor for every M row block.
+                for col in range(n_aie_cols):
+                    b_tap = B_tiles[n_round * n_aie_cols + col]
+                    B_hs[col].fill(B, tap=b_tap, group=task_group)
+                    B_taps.append(b_tap)
+
+                for row_base in range(0, n_row_blocks, 2):
+                    current_rows = min(2, n_row_blocks - row_base)
                     for col in range(n_aie_cols):
-                        b_tap = B_tiles[n_round * n_aie_cols + col]
-                        B_hs[col].fill(B, tap=b_tap, group=task_group)
-                        B_taps.append(b_tap)
+                        n_tile = n_round * n_aie_cols + col
+                        c_tap = TensorAccessPattern(
+                            (M, N),
+                            offset=(
+                                row_base * N_AIE_ROWS * m_c * N + n_tile * n
+                            ),
+                            sizes=[current_rows, 1, N_AIE_ROWS * m_c, n],
+                            strides=[N_AIE_ROWS * m_c * N, 0, N, 1],
+                        )
+                        C_hs[col].drain(C, tap=c_tap, wait=True, group=task_group)
+                        C_taps.append(c_tap)
 
-                    slab_end = slab_base + memtile_replay_rows
-                    for row_base in range(slab_base, slab_end, 2):
-                        current_rows = min(2, slab_end - row_base)
-                        for col in range(n_aie_cols):
-                            n_tile = n_round * n_aie_cols + col
-                            c_tap = TensorAccessPattern(
-                                (M, N),
-                                offset=(
-                                    row_base * N_AIE_ROWS * m_c * N
-                                    + n_tile * n
-                                ),
-                                sizes=[current_rows, 1, N_AIE_ROWS * m_c, n],
-                                strides=[N_AIE_ROWS * m_c * N, 0, N, 1],
-                            )
-                            C_hs[col].drain(
-                                C, tap=c_tap, wait=True, group=task_group
-                            )
-                            C_taps.append(c_tap)
-
-                            for tile_row in range(current_rows):
-                                if col < n_shim_a:
-                                    a_tap = TensorAccessPattern(
-                                        (M, K),
-                                        offset=(
-                                            (row_base + tile_row)
-                                            * N_AIE_ROWS
-                                            * m_c
-                                            * K
-                                            + col
-                                            * a_rows_per_shim
-                                            * m_c
-                                            * K
-                                        ),
-                                        sizes=[
-                                            1,
-                                            config.n_k_tiles,
-                                            m_c * a_rows_per_shim,
-                                            k,
-                                        ],
-                                        strides=[0, k, K, 1],
-                                    )
-                                    A_hs[col].fill(
-                                        A, tap=a_tap, group=task_group
-                                    )
-                                    A_taps.append(a_tap)
-                    task_group.finish()
+                        for tile_row in range(current_rows):
+                            if col < n_shim_a:
+                                a_tap = TensorAccessPattern(
+                                    (M, K),
+                                    offset=(
+                                        (row_base + tile_row)
+                                        * N_AIE_ROWS
+                                        * m_c
+                                        * K
+                                        + col * a_rows_per_shim * m_c * K
+                                    ),
+                                    sizes=[
+                                        1,
+                                        config.n_k_tiles,
+                                        m_c * a_rows_per_shim,
+                                        k,
+                                    ],
+                                    strides=[0, k, K, 1],
+                                )
+                                A_hs[col].fill(A, tap=a_tap, group=task_group)
+                                A_taps.append(a_tap)
+            task_group.finish()
             return
 
         c_index = 0
         tg = TaskGroup()
-        # A joined C object has N_AIE_ROWS * m_c rows.  NPU DMA dimensions
-        # are limited to 1023, so large m_c tiles use one row block per drain
-        # and expose the four joined compute rows as a separate dimension.
-        c_row_batch = 1 if N_AIE_ROWS * m_c > 1023 else 2
-        n_rounds = N // n // n_aie_cols
-        for row_base in range(0, n_row_blocks, c_row_batch):
-            current_rows = min(c_row_batch, n_row_blocks - row_base)
+        for row_base in range(0, n_row_blocks, 2):
+            current_rows = min(2, n_row_blocks - row_base)
             for col in range(n_aie_cols):
-                if c_row_batch == 1:
-                    c_tap = TensorAccessPattern(
-                        (M, N),
-                        offset=row_base * N_AIE_ROWS * m_c * N + col * n,
-                        sizes=[n_rounds, N_AIE_ROWS, m_c, n],
-                        strides=[n * n_aie_cols, m_c * N, N, 1],
-                    )
-                else:
-                    c_tap = C_tiles[c_index]
-                    c_index += 1
-                C_hs[col].drain(C, tap=c_tap, wait=True, group=tg)
-                C_taps.append(c_tap)
+                C_hs[col].drain(C, tap=C_tiles[c_index], wait=True, group=tg)
+                C_taps.append(C_tiles[c_index])
+                c_index += 1
                 for tile_row in range(current_rows):
                     offset = ((row_base + tile_row) * n_shim_a + col) % len(A_tiles)
                     if col < n_shim_a:
@@ -838,7 +433,6 @@ def whole_array_q4ks(
     n: CompileTime[int] = 64,
     n_aie_cols: CompileTime[int] = 8,
     compute_type: CompileTime[str] = "bf16",
-    accumulation_mode: CompileTime[str] = "bf16",
     cache_mode: CompileTime[str] = "stream",
     activation_input: CompileTime[str] = "bf16",
     cache_k: CompileTime[int] = 1024,
@@ -855,7 +449,6 @@ def whole_array_q4ks(
         n,
         n_aie_cols,
         compute_type,
-        accumulation_mode,
         cache_mode,
         activation_input,
         cache_k,
@@ -880,7 +473,6 @@ def generate_taps(**kwargs):
         n=64,
         n_aie_cols=columns,
         compute_type="bf16",
-        accumulation_mode="bf16",
         cache_mode="stream",
         activation_input="bf16",
         cache_k=kwargs.get("K", 1024),
@@ -902,9 +494,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("-n", type=int, default=64)
     parser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=8)
     parser.add_argument("--compute-type", choices=COMPUTE_TYPES, default="bf16")
-    parser.add_argument(
-        "--accumulation-mode", choices=ACCUMULATION_MODES, default="bf16"
-    )
     parser.add_argument("--cache-mode", choices=CACHE_MODES, default="stream")
     parser.add_argument("--activation-input", choices=ACTIVATION_INPUTS, default="bf16")
     parser.add_argument("--cache-k", type=int)
@@ -936,7 +525,6 @@ def _config(opts) -> Q4KSConfig:
         n=opts.n,
         n_aie_cols=opts.n_aie_cols,
         compute_type=opts.compute_type,
-        accumulation_mode=opts.accumulation_mode,
         cache_mode=opts.cache_mode,
         activation_input=opts.activation_input,
         cache_k=opts.cache_k,
@@ -955,7 +543,6 @@ def _kwargs(opts) -> dict:
         n=cfg.n,
         n_aie_cols=cfg.n_aie_cols,
         compute_type=cfg.compute_type,
-        accumulation_mode=cfg.accumulation_mode,
         cache_mode=cfg.cache_mode,
         activation_input=cfg.activation_input,
         cache_k=cfg.cache_k,
@@ -1020,10 +607,14 @@ def _sample_reference(A, native, cfg, rows, cols):
         stored = 0.0
         for k0 in range(0, cfg.K, cfg.k):
             ks = slice(k0, k0 + cfg.k)
-            stored += float(activation[ks] @ weights[ks].astype(np.float32))
-            if cfg.accumulation_mode == "bf16":
-                stored = float(np.asarray(stored, dtype=bfloat16))
-        values[i] = float(np.asarray(stored, dtype=bfloat16))
+            stored = float(
+                np.asarray(
+                    stored
+                    + activation[ks] @ weights[ks].astype(np.float32),
+                    dtype=bfloat16,
+                )
+            )
+        values[i] = stored
     return values
 
 
@@ -1109,7 +700,6 @@ def _run(opts) -> None:
     errors = _verify(opts, cfg, A, native, actual)
     result = {
         "compute_type": cfg.compute_type,
-        "accumulation_mode": cfg.accumulation_mode,
         "cache_mode": cfg.cache_mode,
         "activation_input": cfg.activation_input,
         "M": cfg.M,
@@ -1130,10 +720,7 @@ def _run(opts) -> None:
     _write_results(opts, result)
     print(f"prepared Q4_K in {prepare_ms:.2f} ms; median {median:.2f} GFLOP/s")
     if opts.min_gflops and median < opts.min_gflops:
-        raise RuntimeError(
-            f"performance gate failed: {median:.2f} < "
-            f"{opts.min_gflops:.2f} GFLOP/s"
-        )
+        raise RuntimeError(f"performance gate failed: {median:.2f} < {opts.min_gflops:.2f} GFLOP/s")
     print("PASS!")
 
 

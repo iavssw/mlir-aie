@@ -21,13 +21,12 @@ b_col_maj?=0
 c_col_maj?=0
 
 compute_type?=bf16
-accumulation_mode?=bf16
 cache_mode?=stream
 activation_input?=bf16
 cache_k?=${K}
 n_aie_cols?=8
 
-target_suffix?=${M}x${K}x${N}_${m_c}a${m_a}x${k}x${n}_${n_aie_cols}c_${compute_type}_${accumulation_mode}_${cache_mode}
+target_suffix?=${M}x${K}x${N}_${m_c}a${m_a}x${k}x${n}_${n_aie_cols}c_${compute_type}_${cache_mode}
 xclbin_target?=build/final_${target_suffix}.xclbin
 insts_target?=build/insts_${target_suffix}.bin
 trace_M?=512
@@ -39,17 +38,16 @@ trace_k?=128
 trace_n?=64
 trace_n_aie_cols?=4
 trace_compute_type?=bf16
-trace_accumulation_mode?=bf16
 trace_cache_mode?=stream
 trace_cache_k?=256
-trace_target_suffix?=${trace_M}x${trace_K}x${trace_N}_${trace_m_c}a${trace_m_a}x${trace_k}x${trace_n}_${trace_n_aie_cols}c_${trace_compute_type}_${trace_accumulation_mode}_${trace_cache_mode}
+trace_target_suffix?=${trace_M}x${trace_K}x${trace_N}_${trace_m_c}a${trace_m_a}x${trace_k}x${trace_n}_${trace_n_aie_cols}c_${trace_compute_type}_${trace_cache_mode}
 trace_xclbin_target?=build/trace_${trace_target_suffix}.xclbin
 trace_insts_target?=build/trace_insts_${trace_target_suffix}.bin
 
-aieargs+=--dev npu2 -M ${M} -K ${K} -N ${N} --m-c ${m_c} --m-a ${m_a} -k ${k} -n ${n} --n-aie-cols ${n_aie_cols} --compute-type ${compute_type} --accumulation-mode ${accumulation_mode} --cache-mode ${cache_mode} --activation-input ${activation_input} --cache-k ${cache_k}
-runargs+=--warmup ${warmup} --iters ${iters} --verify=${verify} --verify-samples ${verify_samples} --min-gflops ${min_gflops} --verbosity ${verbosity} --b_col_maj ${b_col_maj} --c_col_maj ${c_col_maj} --tile-m-c ${m_c} --tile-m-a ${m_a} --tile-k ${k} --tile-n ${n} --n-aie-cols ${n_aie_cols} --compute-type ${compute_type} --accumulation-mode ${accumulation_mode} --cache-mode ${cache_mode} --cache-k ${cache_k}
-trace_aieargs=--dev npu2 -M ${trace_M} -K ${trace_K} -N ${trace_N} --m-c ${trace_m_c} --m-a ${trace_m_a} -k ${trace_k} -n ${trace_n} --n-aie-cols ${trace_n_aie_cols} --compute-type ${trace_compute_type} --accumulation-mode ${trace_accumulation_mode} --cache-mode ${trace_cache_mode} --activation-input bf16 --cache-k ${trace_cache_k}
-trace_runargs=--warmup ${warmup} --iters ${iters} --verify=${verify} --verify-samples ${verify_samples} --min-gflops ${min_gflops} --verbosity ${verbosity} --b_col_maj ${b_col_maj} --c_col_maj ${c_col_maj} --tile-m-c ${trace_m_c} --tile-m-a ${trace_m_a} --tile-k ${trace_k} --tile-n ${trace_n} --n-aie-cols ${trace_n_aie_cols} --compute-type ${trace_compute_type} --accumulation-mode ${trace_accumulation_mode} --cache-mode ${trace_cache_mode} --cache-k ${trace_cache_k}
+aieargs+=--dev npu2 -M ${M} -K ${K} -N ${N} --m-c ${m_c} --m-a ${m_a} -k ${k} -n ${n} --n-aie-cols ${n_aie_cols} --compute-type ${compute_type} --cache-mode ${cache_mode} --activation-input ${activation_input} --cache-k ${cache_k}
+runargs+=--warmup ${warmup} --iters ${iters} --verify=${verify} --verify-samples ${verify_samples} --min-gflops ${min_gflops} --verbosity ${verbosity} --b_col_maj ${b_col_maj} --c_col_maj ${c_col_maj} --tile-m-c ${m_c} --tile-m-a ${m_a} --tile-k ${k} --tile-n ${n} --n-aie-cols ${n_aie_cols} --compute-type ${compute_type} --cache-mode ${cache_mode} --cache-k ${cache_k}
+trace_aieargs=--dev npu2 -M ${trace_M} -K ${trace_K} -N ${trace_N} --m-c ${trace_m_c} --m-a ${trace_m_a} -k ${trace_k} -n ${trace_n} --n-aie-cols ${trace_n_aie_cols} --compute-type ${trace_compute_type} --cache-mode ${trace_cache_mode} --activation-input bf16 --cache-k ${trace_cache_k}
+trace_runargs=--warmup ${warmup} --iters ${iters} --verify=${verify} --verify-samples ${verify_samples} --min-gflops ${min_gflops} --verbosity ${verbosity} --b_col_maj ${b_col_maj} --c_col_maj ${c_col_maj} --tile-m-c ${trace_m_c} --tile-m-a ${trace_m_a} --tile-k ${trace_k} --tile-n ${trace_n} --n-aie-cols ${trace_n_aie_cols} --compute-type ${trace_compute_type} --cache-mode ${trace_cache_mode} --cache-k ${trace_cache_k}
 
 .PHONY: all
 all: ${xclbin_target} ${targetname}.exe

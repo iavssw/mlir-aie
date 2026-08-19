@@ -33,7 +33,6 @@ CORE_STACK_BYTES = 0xD00
 CORE_SAFETY_BYTES = 4 * 1024
 MEMTILE_SAFETY_BYTES = 32 * 1024
 COMPUTE_TYPES = ("bf16", "bfp16", "int8")
-ACCUMULATION_MODES = ("bf16", "fp32", "cascade")
 CACHE_MODES = (
     "stream",
     "l1-weight",
@@ -78,7 +77,6 @@ class Q4KSConfig:
     n: int = 64
     n_aie_cols: int = 8
     compute_type: str = "bf16"
-    accumulation_mode: str = "bf16"
     cache_mode: str = "stream"
     activation_input: str = "bf16"
     cache_k: int | None = None
@@ -144,14 +142,6 @@ class Q4KSConfig:
     def c_fifo_depth(self) -> int:
         return 1 if self.m_c >= 128 else 2
 
-    @property
-    def a_fifo_depth(self) -> int:
-        # The cascade pipeline benefits from two resident A tiles and its
-        # validated 64x64 tile still fits with that depth.
-        if self.accumulation_mode == "cascade":
-            return 2
-        return 1 if self.m_a >= 64 else 2
-
     def prepared_tile_bytes(self, storage_type: str) -> int:
         if storage_type == "q4":
             return self.tile_bytes
@@ -176,15 +166,15 @@ class Q4KSConfig:
             "int8": self.k * self.n,
         }[self.compute_type]
         activation_scratch = 0
-        if self.compute_type == "int8":
+        if self.compute_type == "bfp16":
+            activation_scratch = self.m_a * self.k * 9 // 8
+        elif self.compute_type == "int8":
             activation_scratch = (
                 self.m_a * self.k
                 + self.m_a * self.groups_per_tile * (2 + 4)
             )
-        components = {
-            f"A FIFO (depth {self.a_fifo_depth})": (
-                self.a_fifo_depth * self.m_a * self.k * 2
-            ),
+        return {
+            "A FIFO (depth 2)": 2 * self.m_a * self.k * 2,
             "packed-B FIFO (depth 1)": self.tile_bytes,
             f"C FIFO (depth {self.c_fifo_depth})": (
                 self.c_fifo_depth * self.m_c * self.n * 2
@@ -194,9 +184,6 @@ class Q4KSConfig:
             "stack": CORE_STACK_BYTES,
             "safety margin": CORE_SAFETY_BYTES,
         }
-        if self.accumulation_mode in ("fp32", "cascade"):
-            components["FP32 accumulation scratch"] = self.m_c * self.n * 4
-        return components
 
     @property
     def core_memory_bytes(self) -> int:
@@ -252,10 +239,6 @@ class Q4KSConfig:
             raise ValueError(f"n_aie_cols must be one of {SUPPORTED_COLUMNS}")
         if self.compute_type not in COMPUTE_TYPES:
             raise ValueError(f"compute_type must be one of {COMPUTE_TYPES}")
-        if self.accumulation_mode not in ACCUMULATION_MODES:
-            raise ValueError(
-                f"accumulation_mode must be one of {ACCUMULATION_MODES}"
-            )
         if self.cache_mode not in CACHE_MODES:
             raise ValueError(f"cache_mode must be one of {CACHE_MODES}")
         if self.activation_input not in ACTIVATION_INPUTS:
@@ -268,22 +251,6 @@ class Q4KSConfig:
             raise ValueError("k must divide K")
         if self.m_c % self.m_a:
             raise ValueError("m_a must divide m_c")
-        if self.accumulation_mode != "bf16" and self.compute_type != "bfp16":
-            raise ValueError("FP32 and cascade accumulation require bfp16 compute")
-        if self.accumulation_mode == "cascade":
-            if self.m_a != self.m_c:
-                raise ValueError("cascade accumulation requires m_a == m_c")
-            if self.k != 64:
-                raise ValueError(
-                    "cascade accumulation currently requires k == 64; "
-                    "larger specializations exceed AIE program memory"
-                )
-            if self.K % (N_AIE_ROWS * self.k):
-                raise ValueError("cascade accumulation requires 4*k to divide K")
-            if self.cache_mode not in ("stream", "l1-weight"):
-                raise ValueError(
-                    "cascade accumulation currently supports stream or l1-weight"
-                )
         if self.m_a % 16:
             raise ValueError("m_a must be divisible by 16")
         if self.n % 16:
@@ -307,8 +274,6 @@ class Q4KSConfig:
             "m_c": self.m_c,
             "n": self.n,
         }
-        if self.accumulation_mode == "cascade":
-            dma_sizes["4*packed_rows"] = N_AIE_ROWS * self.packed_rows
         bad_dma = {k: v for k, v in dma_sizes.items() if v > 1023}
         if bad_dma:
             details = ", ".join(f"{k}={v}" for k, v in bad_dma.items())

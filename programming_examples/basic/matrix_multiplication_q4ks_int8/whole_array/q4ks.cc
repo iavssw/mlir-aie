@@ -168,7 +168,6 @@ static inline void prepare_bfp16(const uint8 *__restrict packed) {
     }
 }
 
-#if !defined(ACCUM_FP32) && !defined(ACCUM_CASCADE)
 static inline void matmul_bfp16(const bfloat16 *__restrict input_a,
                                 bfloat16 *__restrict output_c,
                                 unsigned subtile) {
@@ -220,204 +219,6 @@ static inline void matmul_bfp16(const bfloat16 *__restrict input_a,
 }
 #endif
 
-#if defined(ACCUM_FP32) || defined(ACCUM_CASCADE)
-static inline aie::accum<accfloat, 64>
-load_fp32_accumulator(const float *__restrict input) {
-  aie::accum<accfloat, 64> result;
-  result.insert(0, aie::accum<accfloat, 32>(aie::load_v<32>(input)));
-  result.insert(1, aie::accum<accfloat, 32>(aie::load_v<32>(input + 32)));
-  return result;
-}
-
-static inline void
-store_fp32_accumulator(float *__restrict output,
-                       const aie::accum<accfloat, 64> &value) {
-  aie::store_v(output, value.template extract<32>(0).to_vector<float>());
-  aie::store_v(output + 32, value.template extract<32>(1).to_vector<float>());
-}
-
-#ifdef ACCUM_CASCADE
-static inline aie::accum<accfloat, 64> load_cascade_accumulator() {
-  return aie::accum<accfloat, 64>(get_scd_v64accfloat(1));
-}
-
-static inline void
-put_cascade_accumulator(const aie::accum<accfloat, 64> &value) {
-  const auto native = value.to_native();
-  put_mcd(extract_v16accfloat(native, 0));
-  put_mcd(extract_v16accfloat(native, 1));
-  put_mcd(extract_v16accfloat(native, 2));
-  put_mcd(extract_v16accfloat(native, 3));
-}
-#endif
-
-static inline void
-mac_bfp16_2x2(const bfloat16 *__restrict input_a, unsigned rb, unsigned nb,
-              aie::accum<accfloat, 64> &c00, aie::accum<accfloat, 64> &c01,
-              aie::accum<accfloat, 64> &c10, aie::accum<accfloat, 64> &c11) {
-  const bfloat16 *__restrict a0 = input_a + rb * kKBlocks * 64;
-  const bfloat16 *__restrict a1 = input_a + (rb + 1) * kKBlocks * 64;
-  for (unsigned kb = 0; kb < kKBlocks; ++kb)
-    chess_flatten_loop {
-      const auto av0 = aie::load_v<64>(a0);
-      const auto av1 = aie::load_v<64>(a1);
-      aie::accum<accfloat, 64> aa0;
-      aie::accum<accfloat, 64> aa1;
-      aa0 = av0;
-      aa1 = av1;
-      const auto ab0 = aa0.template to_vector<bfp16ebs8>();
-      const auto ab1 = aa1.template to_vector<bfp16ebs8>();
-      aie::block_vector_input_buffer_stream<bfp16ebs8, 64> bs0(b_bfp);
-      aie::block_vector_input_buffer_stream<bfp16ebs8, 64> bs1(b_bfp);
-      bs0.seek(kb * kNBlocks + nb);
-      bs1.seek(kb * kNBlocks + nb + 1);
-      const auto bv0 = bs0.pop();
-      const auto bv1 = bs1.pop();
-      c00 = mac_8x8_8x8T(ab0, bv0, c00);
-      c01 = mac_8x8_8x8T(ab0, bv1, c01);
-      c10 = mac_8x8_8x8T(ab1, bv0, c10);
-      c11 = mac_8x8_8x8T(ab1, bv1, c11);
-      a0 += 64;
-      a1 += 64;
-    }
-}
-
-static inline void zero_fp32(float *__restrict output) {
-  const auto zero = aie::zeros<float, 32>();
-  for (unsigned i = 0; i < DIM_M_C * DIM_N; i += 32)
-    aie::store_v(output + i, zero);
-}
-
-static inline void store_bf16(const float *__restrict input,
-                              bfloat16 *__restrict output) {
-  for (unsigned i = 0; i < DIM_M_C * DIM_N; i += 32) {
-    const aie::accum<accfloat, 32> value(aie::load_v<32>(input + i));
-    aie::store_v(output + i, value.template to_vector<bfloat16>());
-  }
-}
-
-#ifdef ACCUM_FP32
-static inline void matmul_bfp16_fp32(const bfloat16 *__restrict input_a,
-                                     float *__restrict output_c,
-                                     unsigned subtile) {
-  output_c += subtile * DIM_M_A * DIM_N;
-  constexpr unsigned row_blocks = DIM_M_A / 8;
-  for (unsigned rb = 0; rb < row_blocks; rb += 2)
-    chess_prepare_for_pipelining {
-      float *__restrict c0 = output_c + rb * kNBlocks * 64;
-      float *__restrict c1 = output_c + (rb + 1) * kNBlocks * 64;
-      for (unsigned nb = 0; nb < kNBlocks; nb += 2)
-        chess_flatten_loop {
-          const bfloat16 *__restrict a0 = input_a + rb * kKBlocks * 64;
-          const bfloat16 *__restrict a1 = input_a + (rb + 1) * kKBlocks * 64;
-          auto c00 = load_fp32_accumulator(c0);
-          auto c01 = load_fp32_accumulator(c0 + 64);
-          auto c10 = load_fp32_accumulator(c1);
-          auto c11 = load_fp32_accumulator(c1 + 64);
-          for (unsigned kb = 0; kb < kKBlocks; ++kb)
-            chess_flatten_loop {
-              const auto av0 = aie::load_v<64>(a0);
-              const auto av1 = aie::load_v<64>(a1);
-              aie::accum<accfloat, 64> aa0;
-              aie::accum<accfloat, 64> aa1;
-              aa0 = av0;
-              aa1 = av1;
-              const auto ab0 = aa0.template to_vector<bfp16ebs8>();
-              const auto ab1 = aa1.template to_vector<bfp16ebs8>();
-              aie::block_vector_input_buffer_stream<bfp16ebs8, 64> bs0(b_bfp);
-              aie::block_vector_input_buffer_stream<bfp16ebs8, 64> bs1(b_bfp);
-              bs0.seek(kb * kNBlocks + nb);
-              bs1.seek(kb * kNBlocks + nb + 1);
-              const auto bv0 = bs0.pop();
-              const auto bv1 = bs1.pop();
-              c00 = mac_8x8_8x8T(ab0, bv0, c00);
-              c01 = mac_8x8_8x8T(ab0, bv1, c01);
-              c10 = mac_8x8_8x8T(ab1, bv0, c10);
-              c11 = mac_8x8_8x8T(ab1, bv1, c11);
-              a0 += 64;
-              a1 += 64;
-            }
-          store_fp32_accumulator(c0, c00);
-          store_fp32_accumulator(c0 + 64, c01);
-          store_fp32_accumulator(c1, c10);
-          store_fp32_accumulator(c1 + 64, c11);
-          c0 += 128;
-          c1 += 128;
-        }
-    }
-}
-#endif
-
-#ifdef ACCUM_CASCADE
-static inline void cascade_put_only(const bfloat16 *__restrict input_a) {
-  constexpr unsigned row_blocks = DIM_M_A / 8;
-  for (unsigned rb = 0; rb < row_blocks; rb += 2)
-    chess_prepare_for_pipelining {
-      for (unsigned nb = 0; nb < kNBlocks; nb += 2)
-        chess_flatten_loop {
-          auto c00 = aie::zeros<accfloat, 64>();
-          auto c01 = aie::zeros<accfloat, 64>();
-          auto c10 = aie::zeros<accfloat, 64>();
-          auto c11 = aie::zeros<accfloat, 64>();
-          mac_bfp16_2x2(input_a, rb, nb, c00, c01, c10, c11);
-          put_cascade_accumulator(c00);
-          put_cascade_accumulator(c01);
-          put_cascade_accumulator(c10);
-          put_cascade_accumulator(c11);
-        }
-    }
-}
-
-static inline void cascade_put_get(const bfloat16 *__restrict input_a) {
-  constexpr unsigned row_blocks = DIM_M_A / 8;
-  for (unsigned rb = 0; rb < row_blocks; rb += 2)
-    chess_prepare_for_pipelining {
-      for (unsigned nb = 0; nb < kNBlocks; nb += 2)
-        chess_flatten_loop {
-          auto c00 = load_cascade_accumulator();
-          auto c01 = load_cascade_accumulator();
-          auto c10 = load_cascade_accumulator();
-          auto c11 = load_cascade_accumulator();
-          mac_bfp16_2x2(input_a, rb, nb, c00, c01, c10, c11);
-          put_cascade_accumulator(c00);
-          put_cascade_accumulator(c01);
-          put_cascade_accumulator(c10);
-          put_cascade_accumulator(c11);
-        }
-    }
-}
-
-static inline void cascade_get_only(const bfloat16 *__restrict input_a,
-                                    float *__restrict output_c) {
-  constexpr unsigned row_blocks = DIM_M_A / 8;
-  for (unsigned rb = 0; rb < row_blocks; rb += 2)
-    chess_prepare_for_pipelining {
-      float *__restrict c0 = output_c + rb * kNBlocks * 64;
-      float *__restrict c1 = output_c + (rb + 1) * kNBlocks * 64;
-      for (unsigned nb = 0; nb < kNBlocks; nb += 2)
-        chess_flatten_loop {
-          auto c00 = load_cascade_accumulator();
-          auto c01 = load_cascade_accumulator();
-          auto c10 = load_cascade_accumulator();
-          auto c11 = load_cascade_accumulator();
-          mac_bfp16_2x2(input_a, rb, nb, c00, c01, c10, c11);
-          c00 = aie::add(c00, load_fp32_accumulator(c0));
-          c01 = aie::add(c01, load_fp32_accumulator(c0 + 64));
-          c10 = aie::add(c10, load_fp32_accumulator(c1));
-          c11 = aie::add(c11, load_fp32_accumulator(c1 + 64));
-          store_fp32_accumulator(c0, c00);
-          store_fp32_accumulator(c0 + 64, c01);
-          store_fp32_accumulator(c1, c10);
-          store_fp32_accumulator(c1 + 64, c11);
-          c0 += 128;
-          c1 += 128;
-        }
-    }
-}
-#endif
-#endif
-#endif
-
 #ifdef COMPUTE_INT8
 alignas(aie::vector_decl_align) static int8 b_i8[DIM_K * DIM_N];
 alignas(aie::vector_decl_align) static int8 a_i8[DIM_M_A * DIM_K];
@@ -436,23 +237,30 @@ static inline unsigned a_index(unsigned row, unsigned col) {
 static inline void quantize_a(const bfloat16 *__restrict input_a) {
   for (unsigned row = 0; row < DIM_M_A; ++row) {
     for (unsigned group = 0; group < kGroups; ++group) {
-      float maximum = 0.0f;
-      for (unsigned x = 0; x < kGroup; ++x) {
-        float value =
-            static_cast<float>(input_a[a_index(row, group * kGroup + x)]);
-        float magnitude = value < 0.0f ? -value : value;
-        maximum = magnitude > maximum ? magnitude : maximum;
+      aie::vector<bfloat16, 8> values[4];
+      auto maxima = aie::broadcast<bfloat16, 8>(0.0f);
+      for (unsigned x = 0; x < kGroup; x += 8) {
+        values[x / 8] =
+            aie::load_v<8>(input_a + a_index(row, group * kGroup + x));
+        maxima = aie::max(maxima, aie::abs(values[x / 8]));
       }
+      const float maximum = static_cast<float>(aie::reduce_max(maxima));
       const float scale = maximum == 0.0f ? 1.0f : maximum / 127.0f;
       a_scale[row * kGroups + group] = static_cast<bfloat16>(scale);
+      const auto inverse_scale = aie::broadcast<float, 8>(1.0f / scale);
+      aie::vector<float, 32> scaled_values;
+      for (unsigned x = 0; x < kGroup; x += 8) {
+        aie::accum<accfloat, 8> as_float;
+        as_float.from_vector(values[x / 8]);
+        const auto scaled =
+            aie::mul(as_float.to_vector<float>(), inverse_scale);
+        scaled_values.insert(x / 8, scaled.to_vector<float>());
+      }
+      const auto quantized = aie::to_fixed<int8>(scaled_values);
       int32 sum = 0;
       for (unsigned x = 0; x < kGroup; ++x) {
-        const unsigned index = a_index(row, group * kGroup + x);
-        const float scaled = static_cast<float>(input_a[index]) / scale;
-        int value = scaled >= 0.0f ? static_cast<int>(scaled + 0.5f)
-                                   : static_cast<int>(scaled - 0.5f);
-        value = value > 127 ? 127 : (value < -127 ? -127 : value);
-        a_i8[index] = static_cast<int8>(value);
+        const int8 value = quantized[x];
+        a_i8[a_index(row, group * kGroup + x)] = value;
         sum += value;
       }
       a_sum[row * kGroups + group] = sum;
@@ -463,61 +271,62 @@ static inline void quantize_a(const bfloat16 *__restrict input_a) {
 static inline void matmul_i8(const bfloat16 *__restrict input_a,
                              const uint8 *__restrict packed,
                              bfloat16 *__restrict output_c, unsigned subtile) {
-  using MMUL = aie::mmul<4, 8, 8, int8, int8, acc32>;
+  using MMUL = aie::mmul<8, 8, 8, int8, int8, acc32>;
   quantize_a(input_a);
   output_c += subtile * DIM_M_A * DIM_N;
   constexpr unsigned row_blocks = DIM_M_A / 8;
   for (unsigned rb = 0; rb < row_blocks; ++rb) {
     for (unsigned nb = 0; nb < kNBlocks; ++nb) {
-      float accum[64];
       bfloat16 *__restrict c = output_c + (rb * kNBlocks + nb) * 64;
-      for (unsigned lane = 0; lane < 64; ++lane)
-        accum[lane] = static_cast<float>(c[lane]);
+      aie::accum<accfloat, 64> c_acc;
+      c_acc.from_vector(aie::load_v<64>(c));
+      auto accum = c_acc.to_vector<float>();
       for (unsigned group = 0; group < kGroups; ++group) {
-        MMUL top = aie::zeros<acc32, 32>();
-        MMUL bottom = aie::zeros<acc32, 32>();
+        MMUL dot = aie::zeros<acc32, 64>();
         for (unsigned inner = 0; inner < 4; ++inner) {
           const unsigned kb = group * 4 + inner;
           const int8 *__restrict ap = a_i8 + (rb * kKBlocks + kb) * 64;
           const int8 *__restrict bp = b_i8 + (kb * kNBlocks + nb) * 64;
-          const auto bv = aie::load_v<64>(bp);
-          top.mac(aie::load_v<32>(ap), bv);
-          bottom.mac(aie::load_v<32>(ap + 32), bv);
+          dot.mac(aie::load_v<64>(ap), aie::load_v<64>(bp));
         }
-        const auto dt = top.template to_vector<int32>();
-        const auto db = bottom.template to_vector<int32>();
+        const auto dots = dot.template to_vector<int32>();
         const bfloat16 *__restrict ws = scale_vector(packed, group, nb);
         const bfloat16 *__restrict wb = bias_vector(packed, group, nb);
-        for (unsigned r4 = 0; r4 < 4; ++r4) {
-          const unsigned logical_row = rb * 8 + r4;
-          const float as =
-              static_cast<float>(a_scale[logical_row * kGroups + group]);
-          const float sum =
-              static_cast<float>(a_sum[logical_row * kGroups + group]);
-          for (unsigned col = 0; col < 8; ++col) {
-            const unsigned lane = r4 * 8 + col;
-            accum[lane] += as * (static_cast<float>(ws[col]) *
-                                     static_cast<float>(dt[lane]) -
-                                 static_cast<float>(wb[col]) * sum);
-          }
-        }
-        for (unsigned r4 = 0; r4 < 4; ++r4) {
-          const unsigned logical_row = rb * 8 + 4 + r4;
-          const float as =
-              static_cast<float>(a_scale[logical_row * kGroups + group]);
-          const float sum =
-              static_cast<float>(a_sum[logical_row * kGroups + group]);
-          for (unsigned col = 0; col < 8; ++col) {
-            const unsigned lane = 32 + r4 * 8 + col;
-            const unsigned dot_lane = r4 * 8 + col;
-            accum[lane] += as * (static_cast<float>(ws[col]) *
-                                     static_cast<float>(db[dot_lane]) -
-                                 static_cast<float>(wb[col]) * sum);
-          }
+        const auto ws16 = aie::load_v<8>(ws).template grow_replicate<16>();
+        const auto wb16 = aie::load_v<8>(wb).template grow_replicate<16>();
+        aie::accum<accfloat, 16> ws_acc;
+        aie::accum<accfloat, 16> wb_acc;
+        ws_acc.from_vector(ws16);
+        wb_acc.from_vector(wb16);
+        const auto ws_float = ws_acc.to_vector<float>();
+        const auto wb_float = wb_acc.to_vector<float>();
+        for (unsigned chunk = 0; chunk < 4; ++chunk) {
+          const unsigned row0 = rb * 8 + chunk * 2;
+          aie::vector<float, 16> scales;
+          scales.insert(0, aie::broadcast<float, 8>(static_cast<float>(
+                               a_scale[row0 * kGroups + group])));
+          scales.insert(1, aie::broadcast<float, 8>(static_cast<float>(
+                               a_scale[(row0 + 1) * kGroups + group])));
+
+          aie::vector<float, 16> sums;
+          sums.insert(0, aie::broadcast<float, 8>(static_cast<float>(
+                             a_sum[row0 * kGroups + group])));
+          sums.insert(1, aie::broadcast<float, 8>(static_cast<float>(
+                             a_sum[(row0 + 1) * kGroups + group])));
+
+          const auto dot_float =
+              aie::to_float<float>(dots.template extract<16>(chunk));
+          const auto weighted_dot = aie::mul(ws_float, dot_float);
+          const auto weighted_sum = aie::mul(wb_float, sums);
+          const auto affine = aie::sub(weighted_dot, weighted_sum);
+          const auto corrected = aie::mul(scales, affine.to_vector<float>());
+          accum.insert(chunk, aie::add(accum.template extract<16>(chunk),
+                                       corrected.to_vector<float>()));
         }
       }
-      for (unsigned lane = 0; lane < 64; ++lane)
-        c[lane] = static_cast<bfloat16>(accum[lane]);
+      aie::accum<accfloat, 64> output;
+      output.from_vector(accum);
+      aie::store_v(c, output.to_vector<bfloat16>());
     }
   }
 }
@@ -540,7 +349,6 @@ void q4ks_matmul_bf16(bfloat16 *a, uint8 *b, bfloat16 *c, int subtile) {
 #endif
 
 #ifdef COMPUTE_BFP16
-#if !defined(ACCUM_FP32) && !defined(ACCUM_CASCADE)
 void q4ks_matmul_bfp16(bfloat16 *a, uint8 *b, bfloat16 *c, int subtile) {
   const auto saved = aie::swap_rounding(aie::rounding_mode::conv_even);
   if (subtile == 0)
@@ -548,50 +356,6 @@ void q4ks_matmul_bfp16(bfloat16 *a, uint8 *b, bfloat16 *c, int subtile) {
   matmul_bfp16(a, c, static_cast<unsigned>(subtile));
   aie::set_rounding(saved);
 }
-#endif
-
-#if defined(ACCUM_FP32) || defined(ACCUM_CASCADE)
-void q4ks_zero_f32(float *output) { zero_fp32(output); }
-
-void q4ks_store_bf16(float *input, bfloat16 *output) {
-  const auto saved = aie::swap_rounding(aie::rounding_mode::conv_even);
-  store_bf16(input, output);
-  aie::set_rounding(saved);
-}
-#endif
-
-#ifdef ACCUM_FP32
-void q4ks_matmul_bfp16_fp32(bfloat16 *a, uint8 *b, float *c, int subtile) {
-  const auto saved = aie::swap_rounding(aie::rounding_mode::conv_even);
-  if (subtile == 0)
-    prepare_bfp16(b);
-  matmul_bfp16_fp32(a, c, static_cast<unsigned>(subtile));
-  aie::set_rounding(saved);
-}
-#endif
-
-#ifdef ACCUM_CASCADE
-void q4ks_cascade_put_only(bfloat16 *a, uint8 *b) {
-  const auto saved = aie::swap_rounding(aie::rounding_mode::conv_even);
-  prepare_bfp16(b);
-  cascade_put_only(a);
-  aie::set_rounding(saved);
-}
-
-void q4ks_cascade_put_get(bfloat16 *a, uint8 *b) {
-  const auto saved = aie::swap_rounding(aie::rounding_mode::conv_even);
-  prepare_bfp16(b);
-  cascade_put_get(a);
-  aie::set_rounding(saved);
-}
-
-void q4ks_cascade_get_only(bfloat16 *a, uint8 *b, float *c) {
-  const auto saved = aie::swap_rounding(aie::rounding_mode::conv_even);
-  prepare_bfp16(b);
-  cascade_get_only(a, c);
-  aie::set_rounding(saved);
-}
-#endif
 #endif
 
 #ifdef COMPUTE_INT8
