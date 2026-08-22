@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+build/
+_build*/
+*.exe
+*.xclbin
+*.bin
+*.prj/
+results/
+trace.txt
+trace*.json
+core

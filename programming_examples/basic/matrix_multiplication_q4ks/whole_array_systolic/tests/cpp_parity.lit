@@ -1,0 +1,8 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// REQUIRES: makefile_examples
+//
+// RUN: make -C %S/.. matrix_multiplication_q4ks_systolic.exe
+// RUN: PYTHONPATH=%S/../.. %python %S/../test_cpp_packing.py --host %S/../matrix_multiplication_q4ks_systolic.exe | FileCheck %s
+// CHECK: PASS!

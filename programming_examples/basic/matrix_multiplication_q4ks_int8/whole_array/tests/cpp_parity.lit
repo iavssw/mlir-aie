@@ -1,8 +1,0 @@
-// Copyright (C) 2026 Advanced Micro Devices, Inc.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// REQUIRES: makefile_examples
-//
-// RUN: make -C %S/.. whole_array_q4ks.exe
-// RUN: %python %S/test_cpp_parity.py %S/../whole_array_q4ks.exe | FileCheck %s
-// CHECK: PASS!

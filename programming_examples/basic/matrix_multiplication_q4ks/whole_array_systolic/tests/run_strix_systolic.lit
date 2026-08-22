@@ -1,0 +1,7 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// REQUIRES: ryzen_ai_npu2, chess
+//
+// RUN: %run_on_npu2% %python %S/../whole_array.py --dev npu2 -M 256 -K 2048 -N 256 --n-tile 32 --weight-flow q4-local --transport core-stream --verify-mode full --warmup 1 --iters 1 | FileCheck %s
+// CHECK: PASS!

@@ -22,6 +22,23 @@ k?=64
 n?=128
 n_aie_cols?=8
 compute_type?=bfp16
+
+# Accumulation mode selects the compiled AIE topology; it is not a runtime
+# switch within one xclbin.  The mode is included in the artifact filename,
+# and makefile-common passes the same value to the compiler and C++ host.
+#
+#   bf16           Physical cascade OFF (default). Accumulate each K tile in
+#                  accfloat, then store/reload BF16 between K tiles.
+#   fp32           Physical cascade OFF. Keep the complete C tile in local
+#                  FP32 scratch and convert to BF16 once at the end.
+#   cascade        Physical cascade ON. Split K over all four AIE rows and
+#                  forward accfloat values through the hardware cascade.
+#   cascade-hybrid Physical cascade ON. Use two independent two-row chains;
+#                  prefix partials use BF16 and the final reduction is accfloat.
+#
+# Use `make perf-cascade` or `make perf-cascade-hybrid` for their validated
+# tile configurations.  Setting only accumulation_mode may be rejected when
+# the other tile/cache constraints do not match the selected topology.
 accumulation_mode?=bf16
 cache_mode?=l1-weight
 activation_input?=bf16
