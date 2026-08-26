@@ -89,12 +89,64 @@ struct Layout {
   std::size_t prepared_bytes() const {
     return static_cast<std::size_t>(K / k) * (N / n) * tile_bytes();
   }
-  int c_depth() const { return m_c >= 128 ? 1 : 2; }
+  int n_n_tiles() const { return N / n; }
+  int full_n_rounds() const { return n_n_tiles() / n_aie_cols; }
+  int tail_n_cols() const { return n_n_tiles() % n_aie_cols; }
+  int logical_n_rounds() const {
+    return full_n_rounds() + (tail_n_cols() ? 1 : 0);
+  }
+  int n_panels_for_col(int col) const {
+    if (col < 0 || col >= n_aie_cols)
+      throw std::invalid_argument("AIE column is outside the active array");
+    return full_n_rounds() + (col < tail_n_cols() ? 1 : 0);
+  }
+  std::size_t column_panel_offset(int col) const {
+    std::size_t result = 0;
+    for (int c = 0; c < col; ++c)
+      result += n_panels_for_col(c);
+    return result;
+  }
+  bool uses_paired_m64_schedule() const {
+    return n_aie_cols == 8 && m_c == 64 && m_a == 32 && k == 64 && n == 128 &&
+           compute_type == "bfp16" && accumulation_mode == "bf16" &&
+           cache_mode == "l1-weight" && M > m_c * n_aie_rows;
+  }
+  bool uses_exact_single_row_wave() const { return M == m_c * n_aie_rows; }
+  bool is_high_perf_256_tile() const {
+    return n_aie_cols == 8 && m_c == 128 && m_a == 32 && k == 64 && n == 128 &&
+           compute_type == "bfp16" && accumulation_mode == "bf16" &&
+           cache_mode == "l1-weight";
+  }
+  bool supports_high_perf_256_contract() const {
+    return is_high_perf_256_tile() && M % 256 == 0 && N % 256 == 0;
+  }
+  bool needs_high_perf_256_schedule() const {
+    if (!supports_high_perf_256_contract())
+      return false;
+    const int row_waves = M / (m_c * n_aie_rows);
+    const int row_tail = M % (m_c * n_aie_rows);
+    const bool ordinary_m =
+        row_tail == 0 && (row_waves == 1 || row_waves % 2 == 0);
+    return !ordinary_m || tail_n_cols() != 0;
+  }
+  // Match the device model: small C objects retain ping-pong buffering, while
+  // one 16-KiB-or-larger object is sufficient to cover the drain and avoids
+  // reserving a redundant large buffer in the 64-KiB compute-tile memory.
+  int c_depth() const { return m_c >= 128 || m_c * n >= 8192 ? 1 : 2; }
   int a_depth() const {
     if (accumulation_mode == "cascade")
       return 2;
     if (accumulation_mode == "cascade-hybrid")
       return 1;
+    if (m_a >= 64 && compute_type == "bfp16" && accumulation_mode == "bf16" &&
+        cache_mode == "l1-weight") {
+      const std::size_t depth_two_bytes =
+          2ULL * m_a * k * 2 + tile_bytes() +
+          static_cast<std::size_t>(c_depth()) * m_c * n * 2 +
+          static_cast<std::size_t>(k) * n * 9 / 8 + 0xD00 + 4 * 1024;
+      if (depth_two_bytes <= 64 * 1024)
+        return 2;
+    }
     return m_a >= 64 ? 1 : 2;
   }
   std::size_t core_memory_bytes() const {
@@ -105,8 +157,8 @@ struct Layout {
     const std::size_t a_fifo =
         static_cast<std::size_t>(a_depth()) * m_a * k * 2;
     const std::size_t b_fifo = tile_bytes();
-    const std::size_t c_fifo =
-        static_cast<std::size_t>(c_depth()) * m_c * n * 2;
+    const std::size_t c_fifo = static_cast<std::size_t>(c_depth()) * m_c * n *
+                               2 * (uses_paired_m64_schedule() ? 2 : 1);
     std::size_t weight_scratch = static_cast<std::size_t>(k) * n * 2;
     std::size_t activation_scratch = 0;
     if (compute_type == "bfp16") {
@@ -150,10 +202,16 @@ struct Layout {
     if (n_aie_cols != 1 && n_aie_cols != 2 && n_aie_cols != 4 &&
         n_aie_cols != 8)
       throw std::invalid_argument("NPU2 columns must be 1, 2, 4, or 8");
-    if (M % (m_c * n_aie_rows) || N % (n * n_aie_cols))
+    if (supports_high_perf_256_contract()) {
+      if (M % 256 || N % 256)
+        throw std::invalid_argument(
+            "high-performance M and N must be 256-aligned");
+    } else if (M % (m_c * n_aie_rows) || N % (n * n_aie_cols)) {
       throw std::invalid_argument(
           "matrix dimensions are incompatible with tiling");
-    if ((M / (m_c * n_aie_rows)) % 2)
+    }
+    if ((M / (m_c * n_aie_rows)) % 2 && !uses_paired_m64_schedule() &&
+        !uses_exact_single_row_wave() && !needs_high_perf_256_schedule())
       throw std::invalid_argument("M/(m_c*4) must be even");
     if (compute_type != "bf16" && compute_type != "bfp16" &&
         compute_type != "int8")
@@ -165,6 +223,11 @@ struct Layout {
     if (accumulation_mode != "bf16" && compute_type != "bfp16")
       throw std::invalid_argument(
           "FP32 and cascade accumulation require bfp16 compute");
+    if (compute_type == "bfp16" && accumulation_mode == "bf16" && m_c == 128 &&
+        m_a == 64 && k == 64 && n == 128)
+      throw std::invalid_argument(
+          "128/64x64x128 is disabled: its depth-one A ObjectFIFO deadlocks "
+          "NPU2; use m_a=32");
     if (accumulation_mode == "cascade") {
       if (m_a != m_c)
         throw std::invalid_argument("cascade accumulation requires m_a == m_c");
@@ -207,7 +270,7 @@ struct Layout {
       throw std::invalid_argument("memtile-weight requires cache_k == K");
     if (packed_rows() > 1023 ||
         (accumulation_mode == "cascade" && n_aie_rows * packed_rows() > 1023) ||
-        K / k > 1023 || N / (n * n_aie_cols) > 1023 || k > 1023 || m_a > 1023 ||
+        K / k > 1023 || logical_n_rounds() > 1023 || k > 1023 || m_a > 1023 ||
         m_c > 1023 || n > 1023)
       throw std::invalid_argument("DMA size exceeds the 10-bit limit");
     if (core_memory_bytes() > 64 * 1024)
@@ -427,14 +490,12 @@ prepare_weights(const Layout &layout, const std::vector<std::uint8_t> &native) {
   const auto decoded = decode(layout, native);
   std::vector<std::uint8_t> prepared(layout.prepared_bytes(), 0);
   const int n_k_tiles = layout.K / layout.k;
-  const int n_n_tiles = layout.N / layout.n;
-  const int n_rounds = n_n_tiles / layout.n_aie_cols;
   const int cascade_rows =
       layout.accumulation_mode == "cascade-hybrid" ? 2 : n_aie_rows;
   const int chunks_per_row = n_k_tiles / cascade_rows;
   std::size_t tile_index = 0;
   for (int col = 0; col < layout.n_aie_cols; ++col) {
-    for (int n_round = 0; n_round < n_rounds; ++n_round) {
+    for (int n_round = 0; n_round < layout.n_panels_for_col(col); ++n_round) {
       const int nt = col + n_round * layout.n_aie_cols;
       for (int stored_kt = 0; stored_kt < n_k_tiles;
            ++stored_kt, ++tile_index) {

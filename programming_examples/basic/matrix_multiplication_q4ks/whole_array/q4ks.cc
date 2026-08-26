@@ -180,9 +180,10 @@ static inline void prepare_bfp16(const uint8 *__restrict packed) {
 #if !defined(ACCUM_FP32) && !defined(ACCUM_CASCADE) &&                         \
     !defined(ACCUM_CASCADE_RESIDENT) && !defined(ACCUM_CASCADE_REGISTER) &&    \
     !defined(ACCUM_CASCADE_CHUNKED) && !defined(ACCUM_CASCADE_SHARED)
-static inline void matmul_bfp16(const bfloat16 *__restrict input_a,
-                                bfloat16 *__restrict output_c,
-                                unsigned subtile) {
+static inline void matmul_bfp16_from(const bfloat16 *__restrict input_a,
+                                     const bfp16ebs8 *__restrict weights,
+                                     bfloat16 *__restrict output_c,
+                                     unsigned subtile) {
   output_c += subtile * DIM_M_A * DIM_N;
   constexpr unsigned row_blocks = DIM_M_A / 8;
   for (unsigned rb = 0; rb < row_blocks; rb += 2)
@@ -207,8 +208,8 @@ static inline void matmul_bfp16(const bfloat16 *__restrict input_a,
               aa1 = av1;
               const auto ab0 = aa0.template to_vector<bfp16ebs8>();
               const auto ab1 = aa1.template to_vector<bfp16ebs8>();
-              aie::block_vector_input_buffer_stream<bfp16ebs8, 64> bs0(b_bfp);
-              aie::block_vector_input_buffer_stream<bfp16ebs8, 64> bs1(b_bfp);
+              aie::block_vector_input_buffer_stream<bfp16ebs8, 64> bs0(weights);
+              aie::block_vector_input_buffer_stream<bfp16ebs8, 64> bs1(weights);
               bs0.seek(kb * kNBlocks + nb);
               bs1.seek(kb * kNBlocks + nb + 1);
               const auto bv0 = bs0.pop();
@@ -228,6 +229,12 @@ static inline void matmul_bfp16(const bfloat16 *__restrict input_a,
           c1 += 128;
         }
     }
+}
+
+static inline void matmul_bfp16(const bfloat16 *__restrict input_a,
+                                bfloat16 *__restrict output_c,
+                                unsigned subtile) {
+  matmul_bfp16_from(input_a, b_bfp, output_c, subtile);
 }
 #endif
 
@@ -1007,6 +1014,78 @@ void q4ks_matmul_bfp16(bfloat16 *a, uint8 *b, bfloat16 *c, int subtile) {
     prepare_bfp16(b);
   matmul_bfp16(a, c, static_cast<unsigned>(subtile));
   aie::set_rounding(saved);
+}
+
+// A 64-row C stream is the internal fringe ABI for the fixed DIM_M_C=128
+// kernel.  Full waves hold two such streams and reuse the one prepared B tile
+// across both; a 256-row array fringe holds only the first stream.  Keeping
+// both entry points in this object shares the same aligned BFP16 scratch.
+void q4ks_matmul_bfp16_mhalf(bfloat16 *a, uint8 *b, bfloat16 *c, int subtile) {
+  const auto saved = aie::swap_rounding(aie::rounding_mode::conv_even);
+  if (subtile == 0)
+    prepare_bfp16(b);
+  matmul_bfp16(a, c, static_cast<unsigned>(subtile));
+  aie::set_rounding(saved);
+}
+
+void q4ks_matmul_bfp16_mhalf_continue(bfloat16 *a, uint8 *b, bfloat16 *c,
+                                      int subtile) {
+  (void)b;
+  const auto saved = aie::swap_rounding(aie::rounding_mode::conv_even);
+  matmul_bfp16(a, c, static_cast<unsigned>(subtile));
+  aie::set_rounding(saved);
+}
+
+void q4ks_zero_bf16_mhalf(bfloat16 *output) {
+  const auto zero = aie::zeros<bfloat16, 32>();
+  for (unsigned i = 0; i < (DIM_M_C / 2) * DIM_N; i += 32)
+    aie::store_v(output + i, zero);
+}
+
+void q4ks_copy_bf16_mhalf_buffer(bfloat16 *input, bfloat16 *output) {
+  constexpr unsigned kHalfElements = (DIM_M_C / 2) * DIM_N;
+  for (unsigned i = 0; i < kHalfElements; i += 32)
+    aie::store_v(output + i, aie::load_v<32>(input + i));
+}
+
+// Paired-m64 schedule: one 128-row local result holds all four 32-row A
+// subtiles.  Prepare B only for segment zero and use the segment directly as
+// the output offset.  This removes the second Q4-to-BFP16 conversion without
+// mutable global schedule state or a second C producer stream.
+void q4ks_matmul_bfp16_pair(bfloat16 *a, uint8 *b, bfloat16 *c, int segment) {
+  const auto saved = aie::swap_rounding(aie::rounding_mode::conv_even);
+  if (segment == 0)
+    prepare_bfp16(b);
+  matmul_bfp16(a, c, static_cast<unsigned>(segment));
+  aie::set_rounding(saved);
+}
+
+void q4ks_zero_bf16_pair(bfloat16 *output) {
+  zero_bf16(output);
+  zero_bf16(output + DIM_M_C * DIM_N);
+}
+
+// An odd 256-row array wave uses all four AIE rows for distinct 64-row
+// results.  The paired C transport still carries two 64-row halves per core,
+// so duplicate the completed half before the MemTile drain writes both views
+// to the same host rows.  This copy is far cheaper than the removed duplicate
+// MMUL work and keeps the high-throughput full-pair ABI unchanged.
+void q4ks_copy_bf16_pair(bfloat16 *output) {
+  constexpr unsigned kHalfElements = DIM_M_C * DIM_N;
+  for (unsigned i = 0; i < kHalfElements; i += 32)
+    aie::store_v(output + kHalfElements + i, aie::load_v<32>(output + i));
+}
+
+// The fixed 128-row high-throughput kernel also serves a final 256-row array
+// half-wave.  Each physical row computes one selected pair of 32-row A
+// subtiles; duplicate those 64 completed rows into the unused half solely so
+// the existing 128-row producer object can be released in predictable chunks.
+// Both transport views target the same logical host rows.  No duplicate MMUL
+// or Q4-to-BFP16 conversion is performed.
+void q4ks_copy_bf16_mhalf(bfloat16 *output) {
+  constexpr unsigned kHalfElements = (DIM_M_C / 2) * DIM_N;
+  for (unsigned i = 0; i < kHalfElements; i += 32)
+    aie::store_v(output + kHalfElements + i, aie::load_v<32>(output + i));
 }
 #endif
 

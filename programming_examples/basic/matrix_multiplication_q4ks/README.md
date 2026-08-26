@@ -135,8 +135,8 @@ The ordinary Make run keeps sampled verification enabled:
 make run
 ~~~
 
-To run the correctness-qualified default with 16 warmups, 20 timed iterations,
-sampled Q4_K verification, and a 12,000-GFLOP/s gate, use:
+To run the correctness-qualified aligned default with 16 warmups, 20 timed
+iterations, sampled Q4_K verification, and a 16,000-GFLOP/s gate, use:
 
 ~~~bash
 make perf-ceiling
@@ -176,10 +176,114 @@ absolute error 0.078125. The C++ verifier also reports BF16 K-tile writeback
 drift directly against the same BFP computation accumulated in FP32; the
 measured drift was max-absolute 0.0390625 and NRMSE 0.0086545.
 
+A post-reboot A/B check on 2026-08-25 found the device back in `Default`
+power mode. The current-source aligned xclbin averaged 15.824 TOPS and the
+archived pre-fringe xclbin averaged 15.893 TOPS under identical inputs and
+timing; the 0.43% difference rules out a meaningful aligned-path regression.
+The current xclbin's best iteration was 16.107 TOPS. The checked-in
+16,000-GFLOP/s target is therefore a strict Turbo/performance-session gate;
+use `min_gflops=0` when doing correctness work at Default clocks.
+
 The result is matrix-issue bound, not compressed-weight bandwidth bound:
 MemTile caching reduces weight ingress but adds sustained replay/synchronizing
 bubbles. Short one-iteration MemTile results reached 16.03 TOPS, but the
 16/20 sustained average is the 12.588-TOPS number above.
+
+### Output and activation tile sweep
+
+The k=64 native-BFP16 path was also swept across legal mC, mA, and n values
+after a reboot, with the NPU in XRT `Default` power mode.  The losing shapes
+use two warmups and five timed iterations; the winner uses the formal 16
+warmups and 20 timed iterations.  Every completed shape passed sampled native
+Q4_K verification.
+
+| `(mC,mA,k,n)` | Throughput | Result |
+|---|---:|---|
+| `(128,32,64,128)` | **16.298 TOPS** | selected |
+| `(128,16,64,128)` | 15.196 TOPS | extra subtile calls |
+| `(64,32,64,128)` | 12.043 TOPS | insufficient B reuse |
+| `(256,32,64,64)` | 7.176 TOPS | narrow N and single-row C drains |
+| `(32,32,64,256)` | 7.974 TOPS | excessive Q4/dequant traffic |
+| `(128,64,64,128)` | ineligible | depth-one A ObjectFIFO wedged amdxdna |
+
+The selected tile is the only safe measured shape above 16 TOPS.  Increasing
+mC to 256 makes the joined C height 1024, beyond the DMA's 10-bit dimension,
+so the runtime must drain one row block at a time.  Increasing n to 256 forces
+mC down to 32 under the 64-KiB L1 budget and quadruples compressed-weight and
+dequantization work.  Reducing mA to 16 doubles kernel-entry/ObjectFIFO
+overhead.  The unsafe mA=64 shape is rejected by both Python and C++ validators
+until its FIFO schedule is redesigned.
+
+The selected `(128,32,64,128)` tile is also the Make/PDI default. Aligned
+512-row by 1024-column waves take the unchanged 16-TOPS fast path. If logical
+M or N has a 256-element fringe, a specialized runtime keeps the same tile:
+each core receives exact 64-row activation halves, keeps one 64x128 result
+half locally, serializes both halves through one C FIFO, and activates only
+the columns that own real N panels. Native Q4_K B is still dequantized once
+per complete 128-row core tile. Thus `M=256,512,768,...` and
+`N=256,512,768,...` are supported without host padding or a globally slower
+`n=32` kernel.
+
+At K > 4096, bounded 2/4/8-tile K slabs keep the shim outer loop within 64.
+Each core then reads a contiguous 128-row A region to avoid the large
+inter-half stride. A final 256-row wave shares that region across a core pair,
+but each worker computes a distinct 64-row half; no MMUL or C row is
+duplicated. If N is also wide, C is drained through ordered 64-row consumer
+chunks so no stride exceeds 20 bits. This extends the fixed-tile contract
+through K,N=32768 without changing the L3 BF16/Q4_K/BF16 ABI.
+
+The exhaustive combined-fringe test at `768x256x1280` passes every output with
+direct-Q4_K NRMSE 0.0159203. At `768x4096x16384`, the integrated fixed-tile
+path averages 13.7065 TOPS with 16 warmups and 20 timed iterations. The lower
+average is expected because one third of its M work is the 256-row half-wave;
+the aligned interior remains the approximately 16-TOPS kernel.
+
+The bounded long-K path also passes sampled hardware verification at
+`768x14336x4096`, averaging 13.797 TOPS in Default mode with direct-Q4_K
+NRMSE 0.02599. Simultaneous long-K/wide-N corners pass Iron resolution, all
+host TAP checks, and Chess/xclbin compilation through
+`768x32768x32768` (slab factor 8). Its device run remains pending because the
+subsequent read-only XRT probe wedged; no driver reset or additional kernel
+load was attempted.
+
+Reproduce the safe screening sweep with:
+
+~~~bash
+make bench-bfp16-tile-sweep
+~~~
+
+### Larger K-tile sweep
+
+Increasing the compile-time K tile reduces BF16 partial-writeback boundaries,
+but it also grows the A FIFO and BFP16 weight scratch.  The following candidates
+are the fastest legal shapes measured at each larger K in the same Default-power
+session:
+
+| K tile | `(mC,mA,k,n)` | Throughput | BF16-writeback drift NRMSE | Direct-Q4 reference NRMSE |
+|---:|---|---:|---:|---:|
+| 64 | `(128,32,64,128)` | **16.481 TOPS** | 0.0086545 | 0.0138094 |
+| 128 | `(64,16,128,128)` | **12.550 TOPS** | 0.0069166 | 0.0122607 |
+| 256 | `(128,64,256,32)` | 8.620 TOPS | 0.0051407 | 0.0109443 |
+| 512 | `(128,16,512,16)` | 5.364 TOPS | 0.0039258 | 0.0104556 |
+
+The k=64 and k=128 rows use 16 warmups and 20 timed iterations; the k=256 and
+k=512 rows are three-iteration screening measurements.  All rows passed the
+same sampled native-Q4_K verification.  The k=128 result lowers writeback-drift
+NRMSE by 20.1% and direct-Q4 NRMSE by 11.2%, but is 23.8% slower.  No larger-K
+candidate exceeds the k=64 BF16-writeback default, so the default is unchanged.
+
+The limiting tradeoff is the 64-KiB compute-tile memory.  Keeping n=128 at
+k=128 requires mC=64, which halves weight reuse and doubles Q4 transfer and
+dequantization.  At k=256 and k=512, n must fall to 32 and 16, multiplying A
+traffic and narrowing the matrix-issue schedule.  k=1024 exceeds the AIE DMA's
+10-bit transfer-dimension limit; its useful shapes also cannot retain their
+buffers, stack, and 4-KiB safety margin within 64 KiB.
+
+Reproduce the sweep with:
+
+~~~bash
+make perf-bfp16-k-sweep
+~~~
 
 For the absolute clock ceiling, first select Turbo mode in another terminal;
 this needs administrator permission and is deliberately not changed by Make:
@@ -202,10 +306,10 @@ A small full-verification run is:
 python3 whole_array.py -M 512 -K 256 -N 512 --m-c 64 --m-a 32 -k 128 -n 64 --n-aie-cols 8 --compute-type bf16 --cache-mode stream --verify-mode full
 ~~~
 
-The native-BFP asymmetric candidate is:
+The native-BFP fixed-tile 256-row/column fringe check is:
 
 ~~~bash
-python3 whole_array.py -M 1024 -K 256 -N 1024 --m-c 128 --m-a 32 -k 64 -n 128 --n-aie-cols 8 --compute-type bfp16 --cache-mode l1-weight --verify-mode full
+python3 whole_array.py -M 256 -K 256 -N 1280 --m-c 128 --m-a 32 -k 64 -n 128 --n-aie-cols 8 --compute-type bfp16 --cache-mode l1-weight --verify-mode full
 ~~~
 
 whole_array.py exports prepare_q4ks_weights, whole_array_q4ks, and
@@ -221,7 +325,7 @@ make run
 Select another candidate with Make variables:
 
 ~~~bash
-make run M=1024 K=256 N=1024 m_c=128 m_a=32 k=64 n=128 compute_type=bfp16 cache_mode=l1-weight
+make run M=768 K=256 N=1280 m_c=128 m_a=32 k=64 n=128 compute_type=bfp16 cache_mode=l1-weight
 ~~~
 
 The stable comparison targets use the exact configurations from the table:

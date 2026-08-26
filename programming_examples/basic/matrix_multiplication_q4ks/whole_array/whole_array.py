@@ -52,6 +52,8 @@ from packing import (  # noqa: E402
     CACHE_MODES,
     COMPUTE_TYPES,
     N_AIE_ROWS,
+    NPU_DMA_MAX_OUTER_SIZE,
+    NPU_DMA_MAX_STRIDE,
     Q4KSConfig,
     Q4_K_GROUP,
     bfp16ebs8_to_float,
@@ -59,6 +61,8 @@ from packing import (  # noqa: E402
     decode_q4_k,
     make_deterministic_native_q4_k,
     float_to_bfp16ebs8,
+    paired_m64_a_transfer_taps,
+    paired_m64_c_transfer_taps,
     prepare_q4ks_weights,
     quantize_activations_int8,
     reference_matmul,
@@ -83,9 +87,21 @@ def _device_for(dev: str, columns: int):
 
 
 def _kernels(config: Q4KSConfig, a_ty, b_ty, c_ty, accumulator_ty=None):
+    # Keep the specialized object name versioned with the paired kernel ABI.
+    # AIECC caches external objects by object_file_name across shape builds;
+    # using the pre-tail-copy name could therefore link an older object that
+    # did not export q4ks_copy_bf16_pair when rebuilding an existing PDI.
+    pair_abi = ""
+    if config.uses_paired_m64_schedule:
+        pair_abi = (
+            "_pair128_tailcopy2" if config.has_paired_m64_tail
+            else "_pair128_tailcopy"
+        )
+    fringe_abi = "_m256n256fringe3" if config.needs_high_perf_256_schedule else ""
+    dequant_abi = "_dqseek1" if config.compute_type == "bfp16" else ""
     name = (
         f"q4ks_{config.compute_type}_{config.m_c}x{config.k}x{config.n}"
-        f"_a{config.m_a}.o"
+        f"_a{config.m_a}{dequant_abi}{pair_abi}{fringe_abi}.o"
     )
     flags = [
         f"-DDIM_M_C={config.m_c}",
@@ -103,14 +119,19 @@ def _kernels(config: Q4KSConfig, a_ty, b_ty, c_ty, accumulator_ty=None):
     symbol = (
         "q4ks_matmul_bfp16_fp32"
         if config.accumulation_mode == "fp32"
-        else f"q4ks_matmul_{config.compute_type}"
+        else (
+            "q4ks_matmul_bfp16_pair"
+            if config.uses_paired_m64_schedule
+            else f"q4ks_matmul_{config.compute_type}"
+        )
     )
     matmul_c_ty = accumulator_ty if config.accumulation_mode == "fp32" else c_ty
+    matmul_arg_types = [a_ty, b_ty, matmul_c_ty, np.int32]
     matmul = ExternalFunction(
         symbol,
         object_file_name=name,
         source_file=KERNEL_SOURCES[config.compute_type],
-        arg_types=[a_ty, b_ty, matmul_c_ty, np.int32],
+        arg_types=matmul_arg_types,
         include_dirs=[aie_config.cxx_header_path(), AIE_KERNEL_INCLUDE],
         compile_flags=flags,
         use_chess=True,
@@ -121,7 +142,12 @@ def _kernels(config: Q4KSConfig, a_ty, b_ty, c_ty, accumulator_ty=None):
             "q4ks_store_bf16", matmul.object_file_name, [accumulator_ty, c_ty]
         )
     else:
-        zero = Kernel("q4ks_zero_bf16", matmul.object_file_name, [c_ty])
+        zero_symbol = (
+            "q4ks_zero_bf16_pair"
+            if config.uses_paired_m64_schedule
+            else "q4ks_zero_bf16"
+        )
+        zero = Kernel(zero_symbol, matmul.object_file_name, [c_ty])
         store = None
     return matmul, zero, store
 
@@ -2594,6 +2620,1101 @@ def _build_cascade_register_design(
     return module
 
 
+def _build_paired_m64_design(
+    dev,
+    config: Q4KSConfig,
+    trace_config: TraceConfig | None,
+    *,
+    generate_taps: bool = False,
+):
+    """Pair 64-row waves so one Q4 dequantization serves 128 A rows.
+
+    The physical array wave remains four rows times 64 rows/core, so M has
+    256-row granularity.  Adjacent waves are nevertheless executed together:
+    every worker owns two independent 64x128 C FIFOs and applies one prepared
+    B tile to four 32-row A subtiles.  Only an odd final wave has half reuse.
+    """
+
+    if not config.uses_paired_m64_schedule:
+        raise ValueError("paired-m64 builder requires its specialized configuration")
+
+    M, K, N = config.M, config.K, config.N
+    m_c, m_a, k, n = config.m_c, config.m_a, config.k, config.n
+    n_cols = config.n_aie_cols
+    n_row_blocks = M // (m_c * N_AIE_ROWS)
+    full_pairs, has_tail = divmod(n_row_blocks, 2)
+    n_rounds = config.n_n_tiles // n_cols
+    # Keep long-K shim loop dimensions within the efficient six-bit range.
+    # The compute-side FIFO still exposes one m_a x k object at a time, so
+    # this changes transfer geometry without changing the paired kernel ABI.
+    a_slab_tiles = config.dma_k_slab_tiles
+    a_slab_k = a_slab_tiles * k
+
+    A_ty = np.ndarray[(M * K,), np.dtype[bfloat16]]
+    B_ty = np.ndarray[(config.prepared_bytes,), np.dtype[np.uint8]]
+    C_ty = np.ndarray[(M * N,), np.dtype[bfloat16]]
+    A_pair_l2_ty = np.ndarray[(2 * m_c * a_slab_k,), np.dtype[bfloat16]]
+    A_l1_ty = np.ndarray[(m_a, k), np.dtype[bfloat16]]
+    B_l1_ty = np.ndarray[(config.packed_rows, k), np.dtype[np.uint8]]
+    C_l2_ty = np.ndarray[(2 * N_AIE_ROWS * m_c * n,), np.dtype[bfloat16]]
+    C_l1_ty = np.ndarray[(2 * m_c, n), np.dtype[bfloat16]]
+    C_tail_l3_ty = np.ndarray[(m_c, n), np.dtype[bfloat16]]
+
+    kernel_a_ty = np.ndarray[(m_a * k,), np.dtype[bfloat16]]
+    kernel_b_ty = np.ndarray[(config.tile_bytes,), np.dtype[np.uint8]]
+    kernel_c_ty = np.ndarray[(2 * m_c * n,), np.dtype[bfloat16]]
+    matmul_kernel, zero_kernel, _ = _kernels(
+        config, kernel_a_ty, kernel_b_ty, kernel_c_ty
+    )
+    copy_kernel = Kernel(
+        "q4ks_copy_bf16_pair", matmul_kernel.object_file_name, [kernel_c_ty]
+    )
+    A_l3l2: list[ObjectFifo] = []
+    A_l2l1: list[ObjectFifo] = []
+    B_l3l2: list[ObjectFifo] = []
+    B_l2l1: list[ObjectFifo] = []
+    C_l1l2: list[list[ObjectFifo]] = [
+        [] for _ in range(N_AIE_ROWS)
+    ]
+    C_l2l3: list[ObjectFifo] = []
+
+    a_to_stream: StreamDims = [
+        (a_slab_tiles * 2 * config.a_subtiles, m_a * k),
+        (k // 8, 8),
+        (m_a, k),
+        (8, 1),
+    ]
+    a_from_stream: StreamDims = [
+        (k // 8, 64),
+        (m_a // 8, 8 * k),
+        (64, 1),
+    ]
+    for row in range(N_AIE_ROWS):
+        a_from_l3: StreamDims | None = None
+        if a_slab_tiles > 1:
+            # Host order is [row][slab-K].  Store [K-tile][row][k]
+            # so egress produces all four 32-row segments for K tile zero,
+            # then all four segments for K tile one.
+            a_from_l3 = [
+                (2 * m_c, k),
+                (a_slab_tiles, 2 * m_c * k),
+                (k, 1),
+            ]
+        parent_a = ObjectFifo(
+            A_pair_l2_ty,
+            name=f"A_PAIR_L3L2_{row}",
+            depth=2,
+            dims_from_stream_per_cons=a_from_l3,
+        )
+        A_l3l2.append(parent_a)
+        if a_slab_tiles > 1:
+            child = ObjectFifo(
+                A_pair_l2_ty,
+                consumer_obj_type=A_l1_ty,
+                name=f"A_PAIR_L2L1_{row}",
+                depth=config.a_fifo_depth,
+                dims_to_stream=a_to_stream,
+                dims_from_stream_per_cons=a_from_stream,
+            )
+            ObjectFifoLink(
+                parent_a.cons(), child.prod(), tile=Tile(2 * row, 1)
+            )
+        else:
+            child = parent_a.cons().split(
+                [0],
+                obj_types=[A_l1_ty],
+                names=[f"A_PAIR_L2L1_{row}"],
+                depths=[config.a_fifo_depth],
+                dims_to_stream=[a_to_stream],
+                dims_from_stream=[a_from_stream],
+            )[0]
+        A_l2l1.append(child)
+
+    c_dims: StreamDims = [
+        (m_c // 8, 8 * n),
+        (8, 8),
+        (n // 8, 64),
+        (8, 1),
+    ]
+    for col in range(n_cols):
+        parent_b = ObjectFifo(B_l1_ty, name=f"B_PAIR_L3L2_{col}", depth=2)
+        B_l3l2.append(parent_b)
+        B_l2l1.append(
+            parent_b.cons().forward(
+                obj_type=B_l1_ty, depth=1, name=f"B_PAIR_L2L1_{col}"
+            )
+        )
+
+        # Each core writes one contiguous 128-row C object, leaving exactly
+        # four producers for the MemTile join.  Together with one contiguous
+        # 128-row A input and B, this fits the physical MemTile DMA budget.
+        parent_c = ObjectFifo(
+            C_l2_ty,
+            name=f"C_PAIR_L2L3_{col}",
+            depth=1,
+            dims_to_stream=c_dims,
+            # Odd-M builds drain the same producer object in legal 64-row
+            # pieces so each duplicate tail half can target the same host
+            # rows without a forbidden zero DMA stride.
+            consumer_obj_type=C_tail_l3_ty if has_tail else None,
+        )
+        C_l2l3.append(parent_c)
+        children = [
+            ObjectFifo(
+                C_l1_ty,
+                name=f"C_PAIR_L1L2_{col}_{row}",
+                depth=1,
+            )
+            for row in range(N_AIE_ROWS)
+        ]
+        ObjectFifoLink(
+            [child.cons(depth=1) for child in children],
+            parent_c.prod(),
+            tile=Tile(col, 1),
+            src_offsets=[2 * m_c * n * row for row in range(N_AIE_ROWS)],
+        )
+        for row in range(N_AIE_ROWS):
+            C_l1l2[row].append(children[row])
+
+    full_pair_tiles = full_pairs * n_rounds
+
+    def core_fn(
+        in_a, in_b, out_c, zero, matmul, copy, tail_segment_base
+    ):
+        pair_loop = (
+            range_(full_pair_tiles) if full_pair_tiles > 1 else range(1)
+        )
+        if full_pair_tiles:
+            for _ in pair_loop:
+                elem_c = out_c.acquire(1)
+                zero(elem_c)
+                k_loop = (
+                    range_(config.n_k_tiles)
+                    if config.n_k_tiles > 1
+                    else range(1)
+                )
+                for _ in k_loop:
+                    elem_b = in_b.acquire(1)
+                    for segment in range(4):
+                        elem_a = in_a.acquire(1)
+                        matmul(elem_a, elem_b, elem_c, segment)
+                        in_a.release(1)
+                    in_b.release(1)
+                out_c.release(1)
+
+        # A final unpaired 256-row wave gives every physical AIE row one
+        # distinct 64-row result.  Consume the duplicated second A half to
+        # preserve FIFO rates, but skip its MMULs and copy the first C half
+        # only after all K tiles have accumulated.
+        if has_tail:
+            tail_loop = range_(n_rounds) if n_rounds > 1 else range(1)
+            for _ in tail_loop:
+                elem_c = out_c.acquire(1)
+                zero(elem_c)
+                k_loop = (
+                    range_(config.n_k_tiles)
+                    if config.n_k_tiles > 1
+                    else range(1)
+                )
+                for _ in k_loop:
+                    elem_b = in_b.acquire(1)
+                    for segment in range(4):
+                        elem_a = in_a.acquire(1)
+                        if (
+                            tail_segment_base
+                            <= segment
+                            < tail_segment_base + config.a_subtiles
+                        ):
+                            matmul(
+                                elem_a,
+                                elem_b,
+                                elem_c,
+                                segment - tail_segment_base,
+                            )
+                        in_a.release(1)
+                    in_b.release(1)
+                copy(elem_c)
+                out_c.release(1)
+
+    def make_worker(row, col):
+        trace = 1 if trace_config and row * n_cols + col == 1 else 0
+
+        # Adjacent physical rows read the same legal contiguous 128-row A
+        # range in the odd tail.  The even row computes its first 64 rows;
+        # the odd row computes its second 64 rows into the first C half.
+        tail_segment_base = 0 if row % 2 == 0 else config.a_subtiles
+
+        def row_core_fn(in_a, in_b, out_c, zero, matmul, copy):
+            core_fn(
+                in_a,
+                in_b,
+                out_c,
+                zero,
+                matmul,
+                copy,
+                tail_segment_base,
+            )
+
+        return Worker(
+            row_core_fn,
+            [
+                A_l2l1[row].cons(),
+                B_l2l1[col].cons(),
+                C_l1l2[row][col].prod(),
+                zero_kernel,
+                matmul_kernel,
+                copy_kernel,
+            ],
+            stack_size=0xD00,
+            trace=trace,
+        )
+
+    workers = Worker.grid(N_AIE_ROWS, n_cols, make_worker)
+    flat_workers = [worker for row in workers for worker in row]
+
+    A_taps: list[TensorAccessPattern] = []
+    B_taps: list[TensorAccessPattern] = []
+    C_taps: list[TensorAccessPattern] = []
+    A_prods = [fifo.prod() for fifo in A_l3l2]
+    B_prods = [fifo.prod() for fifo in B_l3l2]
+    C_conses = [fifo.cons() for fifo in C_l2l3]
+
+    b_specs = b_partition_taps(config)
+
+    def sequence(A, B, C, A_hs, B_hs, C_hs):
+        def submit_b(row_group, n_round=None):
+            for col in range(n_cols):
+                panel_offset = (
+                    0
+                    if n_round is None
+                    else n_round * config.n_k_tiles * config.tile_bytes
+                )
+                rounds = n_rounds if n_round is None else 1
+                if a_slab_tiles > 1:
+                    spec = b_specs[col]
+                    b_tap = TensorAccessPattern(
+                        (config.prepared_bytes,),
+                        offset=spec.offset + panel_offset,
+                        sizes=[
+                            rounds,
+                            config.n_k_tiles // a_slab_tiles,
+                            a_slab_tiles * config.packed_rows,
+                            k,
+                        ],
+                        strides=[
+                            (
+                                config.n_k_tiles * config.tile_bytes
+                                if n_round is None
+                                else 0
+                            ),
+                            a_slab_tiles * config.tile_bytes,
+                            k,
+                            1,
+                        ],
+                    )
+                else:
+                    spec = b_specs[col]
+                    b_tap = TensorAccessPattern(
+                        (config.prepared_bytes,),
+                        offset=spec.offset + panel_offset,
+                        sizes=[rounds, config.n_k_tiles, config.packed_rows, k],
+                        strides=[
+                            (
+                                config.n_k_tiles * config.tile_bytes
+                                if n_round is None
+                                else 0
+                            ),
+                            config.tile_bytes,
+                            k,
+                            1,
+                        ],
+                    )
+                B_hs[col].fill(B, tap=b_tap, group=row_group)
+                B_taps.append(b_tap)
+
+        def submit_a_pair(row_group, row_block):
+            for row in range(N_AIE_ROWS):
+                a_tap = TensorAccessPattern(
+                    (M, K),
+                    offset=(
+                        row_block * N_AIE_ROWS * m_c * K
+                        + row * 2 * m_c * K
+                    ),
+                    # Each core receives four contiguous 32-row subtiles for
+                    # each K tile.  Long-K transfers fold two K tiles into a
+                    # MemTile slab, where they are restored to this order.
+                    sizes=[
+                        n_rounds,
+                        config.n_k_tiles // a_slab_tiles,
+                        2 * m_c,
+                        a_slab_k,
+                    ],
+                    strides=[0, a_slab_k, K, 1],
+                )
+                A_hs[row].fill(A, tap=a_tap, group=row_group)
+                A_taps.append(a_tap)
+
+        def submit_a_tail(row_group, row_block, n_round):
+            del n_round  # The activation wave is replayed for every N panel.
+            for row in range(N_AIE_ROWS):
+                source_row = (row // 2) * 2
+                a_tap = TensorAccessPattern(
+                    (M, K),
+                    offset=(
+                        row_block * N_AIE_ROWS * m_c * K
+                        + source_row * m_c * K
+                    ),
+                    sizes=[
+                        config.n_k_tiles // a_slab_tiles,
+                        2 * m_c,
+                        a_slab_k,
+                    ],
+                    strides=[a_slab_k, K, 1],
+                )
+                A_hs[row].fill(A, tap=a_tap, group=row_group)
+                A_taps.append(a_tap)
+
+        def submit_c_pair(row_group, row_block):
+            for col in range(n_cols):
+                # Eight consecutive 64-row child objects avoid the wide
+                # 256-row wave stride that exceeds the 20-bit DMA field at
+                # N=14336.
+                c_tap = TensorAccessPattern(
+                    (M, N),
+                    offset=(
+                        row_block * N_AIE_ROWS * m_c * N + col * n
+                    ),
+                    sizes=[n_rounds, 2 * N_AIE_ROWS, m_c, n],
+                    strides=[n * n_cols, m_c * N, N, 1],
+                )
+                C_hs[col].drain(C, tap=c_tap, wait=True, group=row_group)
+                C_taps.append(c_tap)
+
+        def submit_c_tail_chunks(
+            row_group, row_block, n_round, chunk_begin, chunk_end
+        ):
+            for chunk in range(chunk_begin, chunk_end):
+                row = chunk // 2
+                for col in range(n_cols):
+                    c_tap = TensorAccessPattern(
+                        (M, N),
+                        offset=(
+                            row_block * N_AIE_ROWS * m_c * N
+                            + row * m_c * N
+                            + (n_round * n_cols + col) * n
+                        ),
+                        sizes=[1, 1, m_c, n],
+                        strides=[1, 1, N, 1],
+                    )
+                    C_hs[col].drain(
+                        C, tap=c_tap, wait=True, group=row_group
+                    )
+                    C_taps.append(c_tap)
+
+        for pair in range(full_pairs):
+            row_group = TaskGroup()
+            submit_b(row_group)
+            submit_a_pair(row_group, pair * 2)
+            submit_c_pair(row_group, pair * 2)
+            row_group.finish()
+
+        if has_tail:
+            row_block = full_pairs * 2
+            for n_round in range(n_rounds):
+                # Start all inputs together with the first C chunk.  Once the
+                # core releases its full paired object, drain the remaining
+                # seven chunks in two bounded task groups (32 and 24 tasks).
+                row_group = TaskGroup()
+                submit_b(row_group, n_round=n_round)
+                submit_a_tail(row_group, row_block, n_round)
+                submit_c_tail_chunks(
+                    row_group, row_block, n_round, 0, 1
+                )
+                row_group.finish()
+                for chunk_begin, chunk_end in ((1, 5), (5, 8)):
+                    row_group = TaskGroup()
+                    submit_c_tail_chunks(
+                        row_group,
+                        row_block,
+                        n_round,
+                        chunk_begin,
+                        chunk_end,
+                    )
+                    row_group.finish()
+
+    runtime = Runtime(
+        sequence,
+        [A_ty, B_ty, C_ty, A_prods, B_prods, C_conses],
+    )
+    program = Program(dev, runtime, workers=flat_workers)
+    if trace_config:
+        raise ValueError("paired-m64 uses all eight columns; trace is unavailable")
+    module = program.resolve_program()
+    if generate_taps:
+        # Assert the runtime construction remains identical to the lightweight
+        # host-side model used by packing/order tests.
+        model_a = paired_m64_a_transfer_taps(config)
+        model_c = paired_m64_c_transfer_taps(config)
+        assert len(A_taps) == len(model_a)
+        assert len(C_taps) == len(model_c)
+        return (
+            TensorAccessSequence.from_taps(A_taps),
+            TensorAccessSequence.from_taps(B_taps),
+            TensorAccessSequence.from_taps(C_taps),
+        )
+    return module
+
+
+def _build_high_perf_256_design(
+    dev,
+    config: Q4KSConfig,
+    trace_config: TraceConfig | None,
+    *,
+    generate_taps: bool = False,
+):
+    """No-duplication 256-granular wrapper around the 128-row kernel.
+
+    Internally each physical row's activation stream carries two 64-row chunks.
+    A complete 512-row wave holds both results while one prepared B tile is
+    reused across all four 32-row subtiles.  The final 256-row wave carries
+    only the first chunk, so neither A nor C is duplicated.  Stream joins place
+    the four physical rows contiguously in host order and remain encodable at
+    N=32768 because their only row stride is the logical host N.
+    """
+
+    if not config.needs_high_perf_256_schedule:
+        raise ValueError("high-performance fringe builder requires a fringe shape")
+
+    M, K, N = config.M, config.K, config.N
+    m_c, m_a, k, n = config.m_c, config.m_a, config.k, config.n
+    n_cols = config.n_aie_cols
+    half_m = m_c // 2
+    half_subtiles = config.a_subtiles // 2
+    full_m_blocks = config.full_m_blocks
+    has_m_tail = config.has_high_perf_m_tail
+    full_n_rounds = config.full_n_rounds
+    tail_n_cols = config.tail_n_cols
+    a_slab_tiles = config.dma_k_slab_tiles
+    a_slab_k = a_slab_tiles * k
+    # Once the inter-half host stride no longer fits, give each core one
+    # contiguous 128-row A region. The C drain below applies the inverse row
+    # mapping. This retains one ordered DMA task and one full-row MemTile slab
+    # instead of racing two independent fills on the same producer handle.
+    contiguous_core_rows = N_AIE_ROWS * half_m * K > NPU_DMA_MAX_STRIDE
+    chunk_c_output = contiguous_core_rows and m_c * N > NPU_DMA_MAX_STRIDE
+    a_parent_rows = m_c if contiguous_core_rows else half_m
+    a_parent_subtiles = config.a_subtiles if contiguous_core_rows else half_subtiles
+
+    A_ty = np.ndarray[(M * K,), np.dtype[bfloat16]]
+    B_ty = np.ndarray[(config.prepared_bytes,), np.dtype[np.uint8]]
+    C_ty = np.ndarray[(M * N,), np.dtype[bfloat16]]
+    A_l2_ty = np.ndarray[(a_parent_rows * a_slab_k,), np.dtype[bfloat16]]
+    A_l1_ty = np.ndarray[(m_a, k), np.dtype[bfloat16]]
+    B_l1_ty = np.ndarray[(config.packed_rows, k), np.dtype[np.uint8]]
+    C_l2_ty = np.ndarray[(N_AIE_ROWS * half_m * n,), np.dtype[bfloat16]]
+    C_l1_ty = np.ndarray[(half_m, n), np.dtype[bfloat16]]
+
+    kernel_a_ty = np.ndarray[(m_a * k,), np.dtype[bfloat16]]
+    kernel_b_ty = np.ndarray[(config.tile_bytes,), np.dtype[np.uint8]]
+    kernel_full_c_ty = np.ndarray[(m_c * n,), np.dtype[bfloat16]]
+    kernel_half_c_ty = np.ndarray[(half_m * n,), np.dtype[bfloat16]]
+    base_matmul, _, _ = _kernels(
+        config, kernel_a_ty, kernel_b_ty, kernel_full_c_ty
+    )
+    zero_half_kernel = Kernel(
+        "q4ks_zero_bf16_mhalf",
+        base_matmul.object_file_name,
+        [kernel_half_c_ty],
+    )
+    matmul_half_kernel = Kernel(
+        "q4ks_matmul_bfp16_mhalf",
+        base_matmul.object_file_name,
+        [kernel_a_ty, kernel_b_ty, kernel_half_c_ty, np.int32],
+    )
+    matmul_continue_kernel = Kernel(
+        "q4ks_matmul_bfp16_mhalf_continue",
+        base_matmul.object_file_name,
+        [kernel_a_ty, kernel_b_ty, kernel_half_c_ty, np.int32],
+    )
+    copy_half_buffer_kernel = Kernel(
+        "q4ks_copy_bf16_mhalf_buffer",
+        base_matmul.object_file_name,
+        [kernel_half_c_ty, kernel_half_c_ty],
+    )
+
+    A_l3l2: list[ObjectFifo] = []
+    A_l2l1: list[ObjectFifo] = []
+    B_l3l2: list[ObjectFifo] = []
+    B_l2l1: list[ObjectFifo] = []
+    C_l1l2: list[list[ObjectFifo]] = [[] for _ in range(N_AIE_ROWS)]
+    C_l2l3: list[ObjectFifo] = []
+
+    a_to_stream: StreamDims = [
+        (a_slab_tiles * a_parent_subtiles, m_a * k),
+        (k // 8, 8),
+        (m_a, k),
+        (8, 1),
+    ]
+    a_from_stream: StreamDims = [
+        (k // 8, 64),
+        (m_a // 8, 8 * k),
+        (64, 1),
+    ]
+    for row in range(N_AIE_ROWS):
+        a_from_l3: StreamDims | None = None
+        if a_slab_tiles > 1:
+            a_from_l3 = [
+                (a_parent_rows, k),
+                (a_slab_tiles, a_parent_rows * k),
+                (k, 1),
+            ]
+        parent_a = ObjectFifo(
+            A_l2_ty,
+            name=f"A_HP256_L3L2_{row}",
+            depth=2,
+            dims_from_stream_per_cons=a_from_l3,
+        )
+        A_l3l2.append(parent_a)
+        if a_slab_tiles > 1:
+            child_a = ObjectFifo(
+                A_l2_ty,
+                consumer_obj_type=A_l1_ty,
+                name=f"A_HP256_L2L1_{row}",
+                depth=2,
+                dims_to_stream=a_to_stream,
+                dims_from_stream_per_cons=a_from_stream,
+            )
+            ObjectFifoLink(
+                parent_a.cons(), child_a.prod(), tile=Tile(2 * row, 1)
+            )
+        else:
+            child_a = parent_a.cons().split(
+                [0],
+                obj_types=[A_l1_ty],
+                names=[f"A_HP256_L2L1_{row}"],
+                depths=[2],
+                dims_to_stream=[a_to_stream],
+                dims_from_stream=[a_from_stream],
+            )[0]
+        A_l2l1.append(child_a)
+
+    c_dims: StreamDims = [
+        (half_m // 8, 8 * n),
+        (8, 8),
+        (n // 8, 64),
+        (8, 1),
+    ]
+    for col in range(n_cols):
+        parent_b = ObjectFifo(B_l1_ty, name=f"B_HP256_L3L2_{col}", depth=2)
+        B_l3l2.append(parent_b)
+        B_l2l1.append(
+            parent_b.cons().forward(
+                obj_type=B_l1_ty, depth=1, name=f"B_HP256_L2L1_{col}"
+            )
+        )
+        parent_c = ObjectFifo(
+            C_l2_ty,
+            name=f"C_HP256_L2L3_{col}",
+            depth=1,
+            dims_to_stream=c_dims,
+            # When both K and N are large, contiguous-core A mapping makes
+            # the four C row blocks non-contiguous in L3. Expose one 64-row
+            # consumer object at a time so every shim drain uses only stride N.
+            consumer_obj_type=C_l1_ty if chunk_c_output else None,
+        )
+        C_l2l3.append(parent_c)
+        children = parent_c.prod().join(
+            [half_m * n * row for row in range(N_AIE_ROWS)],
+            # The join contributes one storage slot on the producer tile;
+            # depth one here therefore materializes the two 64-row objects
+            # needed by acquire(2), not three 16-KiB buffers.
+            depths=[1] * N_AIE_ROWS,
+            obj_types=[C_l1_ty] * N_AIE_ROWS,
+            names=[f"C_HP256_L1L2_{col}_{row}" for row in range(N_AIE_ROWS)],
+        )
+        for row in range(N_AIE_ROWS):
+            C_l1l2[row].append(children[row])
+
+    full_main_tiles = full_m_blocks * full_n_rounds
+
+    def core_fn(
+        in_a,
+        in_b,
+        out_c,
+        local_c0,
+        zero,
+        matmul,
+        matmul_continue,
+        copy_half,
+        active_tail_col,
+        tail_subtile_base,
+    ):
+        if full_main_tiles:
+            tile_loop = range_(full_main_tiles) if full_main_tiles > 1 else range(1)
+            for _ in tile_loop:
+                elem_c1 = out_c.acquire(1)
+                zero(local_c0)
+                zero(elem_c1)
+                k_loop = range_(config.n_k_tiles) if config.n_k_tiles > 1 else range(1)
+                for _ in k_loop:
+                    elem_b = in_b.acquire(1)
+                    for subtile in range(half_subtiles):
+                        elem_a = in_a.acquire(1)
+                        matmul(elem_a, elem_b, local_c0, subtile)
+                        in_a.release(1)
+                    for subtile in range(half_subtiles):
+                        elem_a = in_a.acquire(1)
+                        matmul_continue(elem_a, elem_b, elem_c1, subtile)
+                        in_a.release(1)
+                    in_b.release(1)
+                # Emit C1 first, then copy/emit C0 through the same one-slot
+                # producer.  Runtime TAPs restore logical row order.
+                out_c.release(1)
+                elem_c0 = out_c.acquire(1)
+                copy_half(local_c0, elem_c0)
+                out_c.release(1)
+
+        if tail_n_cols and full_m_blocks:
+            tail_loop = range_(full_m_blocks) if full_m_blocks > 1 else range(1)
+            for _ in tail_loop:
+                if active_tail_col:
+                    elem_c1 = out_c.acquire(1)
+                    zero(local_c0)
+                    zero(elem_c1)
+                k_loop = range_(config.n_k_tiles) if config.n_k_tiles > 1 else range(1)
+                for _ in k_loop:
+                    if active_tail_col:
+                        elem_b = in_b.acquire(1)
+                    for subtile in range(half_subtiles):
+                        elem_a = in_a.acquire(1)
+                        if active_tail_col:
+                            matmul(elem_a, elem_b, local_c0, subtile)
+                        in_a.release(1)
+                    for subtile in range(half_subtiles):
+                        elem_a = in_a.acquire(1)
+                        if active_tail_col:
+                            matmul_continue(elem_a, elem_b, elem_c1, subtile)
+                        in_a.release(1)
+                    if active_tail_col:
+                        in_b.release(1)
+                if active_tail_col:
+                    out_c.release(1)
+                    elem_c0 = out_c.acquire(1)
+                    copy_half(local_c0, elem_c0)
+                    out_c.release(1)
+
+        if has_m_tail and full_n_rounds:
+            half_loop = range_(full_n_rounds) if full_n_rounds > 1 else range(1)
+            for _ in half_loop:
+                elem_c0 = out_c.acquire(1)
+                zero(elem_c0)
+                k_loop = range_(config.n_k_tiles) if config.n_k_tiles > 1 else range(1)
+                for _ in k_loop:
+                    elem_b = in_b.acquire(1)
+                    tail_subtiles = (
+                        config.a_subtiles if contiguous_core_rows else half_subtiles
+                    )
+                    for subtile in range(tail_subtiles):
+                        elem_a = in_a.acquire(1)
+                        if (
+                            tail_subtile_base
+                            <= subtile
+                            < tail_subtile_base + half_subtiles
+                        ):
+                            matmul(
+                                elem_a,
+                                elem_b,
+                                elem_c0,
+                                subtile - tail_subtile_base,
+                            )
+                        in_a.release(1)
+                    in_b.release(1)
+                out_c.release(1)
+
+        if has_m_tail and tail_n_cols:
+            if active_tail_col:
+                elem_c0 = out_c.acquire(1)
+                zero(elem_c0)
+            k_loop = range_(config.n_k_tiles) if config.n_k_tiles > 1 else range(1)
+            for _ in k_loop:
+                if active_tail_col:
+                    elem_b = in_b.acquire(1)
+                tail_subtiles = (
+                    config.a_subtiles if contiguous_core_rows else half_subtiles
+                )
+                for subtile in range(tail_subtiles):
+                    elem_a = in_a.acquire(1)
+                    if (
+                        active_tail_col
+                        and tail_subtile_base
+                        <= subtile
+                        < tail_subtile_base + half_subtiles
+                    ):
+                        matmul(
+                            elem_a,
+                            elem_b,
+                            elem_c0,
+                            subtile - tail_subtile_base,
+                        )
+                    in_a.release(1)
+                if active_tail_col:
+                    in_b.release(1)
+            if active_tail_col:
+                out_c.release(1)
+
+    def make_worker(row, col):
+        trace = 1 if trace_config and row * n_cols + col == 1 else 0
+
+        def column_core_fn(
+            in_a,
+            in_b,
+            out_c,
+            local_c0,
+            zero,
+            matmul,
+            matmul_continue,
+            copy_half,
+        ):
+            core_fn(
+                in_a,
+                in_b,
+                out_c,
+                local_c0,
+                zero,
+                matmul,
+                matmul_continue,
+                copy_half,
+                col < tail_n_cols,
+                half_subtiles if contiguous_core_rows and row % 2 else 0,
+            )
+
+        local_c0 = Buffer(
+            kernel_half_c_ty, name=f"C_HP256_local_0_{row}_{col}"
+        )
+        return Worker(
+            column_core_fn,
+            [
+                A_l2l1[row].cons(),
+                B_l2l1[col].cons(),
+                C_l1l2[row][col].prod(),
+                local_c0,
+                zero_half_kernel,
+                matmul_half_kernel,
+                matmul_continue_kernel,
+                copy_half_buffer_kernel,
+            ],
+            stack_size=0xD00,
+            trace=trace,
+        )
+
+    workers = Worker.grid(N_AIE_ROWS, n_cols, make_worker)
+    flat_workers = [worker for row in workers for worker in row]
+
+    A_taps: list[TensorAccessPattern] = []
+    B_taps: list[TensorAccessPattern] = []
+    C_taps: list[TensorAccessPattern] = []
+    A_prods = [fifo.prod() for fifo in A_l3l2]
+    B_prods = [fifo.prod() for fifo in B_l3l2]
+    C_conses = [fifo.cons() for fifo in C_l2l3]
+    b_specs = b_partition_taps(config)
+    panel_bytes = config.n_k_tiles * config.tile_bytes
+
+    def sequence(A, B, C, A_hs, B_hs, C_hs):
+        pending_group = None
+
+        def overlap_with_previous(group):
+            nonlocal pending_group
+            # Enqueue the next panel before awaiting the prior panel, matching
+            # the proven whole-array ping-pong transfer-block schedule.
+            if pending_group is not None:
+                pending_group.finish()
+            pending_group = group
+
+        def submit_b(group, panel_begin, panel_count, active_cols):
+            if panel_count == 0:
+                return
+            for col in range(active_cols):
+                spec = b_specs[col]
+                b_tap = TensorAccessPattern(
+                    (config.prepared_bytes,),
+                    offset=spec.offset + panel_begin * panel_bytes,
+                    sizes=[
+                        panel_count,
+                        config.n_k_tiles // a_slab_tiles,
+                        a_slab_tiles * config.packed_rows,
+                        k,
+                    ],
+                    strides=[
+                        panel_bytes if panel_count > 1 else 0,
+                        a_slab_tiles * config.tile_bytes,
+                        k,
+                        1,
+                    ],
+                )
+                B_hs[col].fill(B, tap=b_tap, group=group)
+                B_taps.append(b_tap)
+
+        def submit_a_full(group, row_block):
+            row_base = row_block * N_AIE_ROWS * m_c
+            for row in range(N_AIE_ROWS):
+                if contiguous_core_rows:
+                    a_tap = TensorAccessPattern(
+                        (M, K),
+                        offset=(row_base + row * m_c) * K,
+                        sizes=[
+                            config.n_k_tiles // a_slab_tiles,
+                            m_c,
+                            a_slab_k,
+                        ],
+                        strides=[a_slab_k, K, 1],
+                    )
+                else:
+                    a_tap = TensorAccessPattern(
+                        (M, K),
+                        offset=(row_base + row * half_m) * K,
+                        sizes=[
+                            config.n_k_tiles // a_slab_tiles,
+                            2,
+                            half_m,
+                            a_slab_k,
+                        ],
+                        strides=[
+                            a_slab_k,
+                            N_AIE_ROWS * half_m * K,
+                            K,
+                            1,
+                        ],
+                    )
+                A_hs[row].fill(A, tap=a_tap, group=group)
+                A_taps.append(a_tap)
+
+        def submit_a_tail(group):
+            row_base = full_m_blocks * N_AIE_ROWS * m_c
+            for row in range(N_AIE_ROWS):
+                source_row = (
+                    (row // 2) * m_c if contiguous_core_rows else row * half_m
+                )
+                a_tap = TensorAccessPattern(
+                    (M, K),
+                    offset=(row_base + source_row) * K,
+                    sizes=[
+                        config.n_k_tiles // a_slab_tiles,
+                        a_parent_rows,
+                        a_slab_k,
+                    ],
+                    strides=[a_slab_k, K, 1],
+                )
+                A_hs[row].fill(A, tap=a_tap, group=group)
+                A_taps.append(a_tap)
+
+        def submit_c_full(group, row_block, panel_begin, panel_count, active_cols):
+            if panel_count == 0:
+                return
+            row_base = row_block * N_AIE_ROWS * m_c
+            for col in range(active_cols):
+                n_tile = panel_begin * n_cols + col
+                # Worker emission order is C1 then C0 so only one producer
+                # object is live.  Two exact-size drains restore host order.
+                c1_offset_rows = (
+                    row_base + half_m
+                    if contiguous_core_rows
+                    else row_base + N_AIE_ROWS * half_m
+                )
+                c_sizes = (
+                    [1, N_AIE_ROWS, half_m, n]
+                    if contiguous_core_rows
+                    else [1, N_AIE_ROWS * half_m, n]
+                )
+                c_strides = (
+                    [1, m_c * N, N, 1]
+                    if contiguous_core_rows
+                    else [1, N, 1]
+                )
+                c1_tap = TensorAccessPattern(
+                    (M, N),
+                    offset=c1_offset_rows * N + n_tile * n,
+                    sizes=c_sizes,
+                    strides=c_strides,
+                )
+                C_hs[col].drain(C, tap=c1_tap, wait=True, group=group)
+                C_taps.append(c1_tap)
+                c0_tap = TensorAccessPattern(
+                    (M, N),
+                    offset=row_base * N + n_tile * n,
+                    sizes=c_sizes,
+                    strides=c_strides,
+                )
+                C_hs[col].drain(C, tap=c0_tap, wait=True, group=group)
+                C_taps.append(c0_tap)
+
+        def submit_c_tail(group, n_round, active_cols):
+            row_base = full_m_blocks * N_AIE_ROWS * m_c
+            for col in range(active_cols):
+                n_tile = n_round * n_cols + col
+                c_tap = TensorAccessPattern(
+                    (M, N),
+                    offset=row_base * N + n_tile * n,
+                    sizes=[1, N_AIE_ROWS * half_m, n],
+                    strides=[1, N, 1],
+                )
+                C_hs[col].drain(C, tap=c_tap, wait=True, group=group)
+                C_taps.append(c_tap)
+
+        def submit_c_full_chunks(
+            group,
+            row_block,
+            n_round,
+            chunk_begin,
+            chunk_end,
+            active_cols,
+        ):
+            row_base = row_block * N_AIE_ROWS * m_c
+            for chunk in range(chunk_begin, chunk_end):
+                second_half = chunk < N_AIE_ROWS
+                row = chunk % N_AIE_ROWS
+                logical_row = (
+                    row_base + row * m_c + (half_m if second_half else 0)
+                )
+                for col in range(active_cols):
+                    n_tile = n_round * n_cols + col
+                    c_tap = TensorAccessPattern(
+                        (M, N),
+                        offset=logical_row * N + n_tile * n,
+                        sizes=[1, 1, half_m, n],
+                        strides=[1, 1, N, 1],
+                    )
+                    C_hs[col].drain(C, tap=c_tap, wait=True, group=group)
+                    C_taps.append(c_tap)
+
+        def submit_c_tail_chunks(
+            group, n_round, chunk_begin, chunk_end, active_cols
+        ):
+            row_base = full_m_blocks * N_AIE_ROWS * m_c
+            for chunk in range(chunk_begin, chunk_end):
+                for col in range(active_cols):
+                    n_tile = n_round * n_cols + col
+                    c_tap = TensorAccessPattern(
+                        (M, N),
+                        offset=(row_base + chunk * half_m) * N + n_tile * n,
+                        sizes=[1, 1, half_m, n],
+                        strides=[1, 1, N, 1],
+                    )
+                    C_hs[col].drain(C, tap=c_tap, wait=True, group=group)
+                    C_taps.append(c_tap)
+
+        def submit_chunked_panel(
+            row_block, n_round, active_cols, *, is_m_tail
+        ):
+            # The first completed C chunk proves every worker has consumed its
+            # A/B input for this panel, so finishing this group may safely free
+            # the input tasks. Remaining chunks are drained in groups of at
+            # most 32 tasks, respecting the runtime task-group limit.
+            group = TaskGroup()
+            submit_b(group, n_round, 1, active_cols)
+            if is_m_tail:
+                submit_a_tail(group)
+                submit_c_tail_chunks(group, n_round, 0, 1, active_cols)
+                total_chunks = N_AIE_ROWS
+            else:
+                submit_a_full(group, row_block)
+                submit_c_full_chunks(
+                    group, row_block, n_round, 0, 1, active_cols
+                )
+                total_chunks = 2 * N_AIE_ROWS
+            group.finish()
+
+            chunk_begin = 1
+            chunks_per_group = max(1, 32 // active_cols)
+            while chunk_begin < total_chunks:
+                chunk_end = min(total_chunks, chunk_begin + chunks_per_group)
+                group = TaskGroup()
+                if is_m_tail:
+                    submit_c_tail_chunks(
+                        group,
+                        n_round,
+                        chunk_begin,
+                        chunk_end,
+                        active_cols,
+                    )
+                else:
+                    submit_c_full_chunks(
+                        group,
+                        row_block,
+                        n_round,
+                        chunk_begin,
+                        chunk_end,
+                        active_cols,
+                    )
+                group.finish()
+                chunk_begin = chunk_end
+
+        for row_block in range(full_m_blocks):
+            for n_round in range(full_n_rounds):
+                if chunk_c_output:
+                    submit_chunked_panel(
+                        row_block, n_round, n_cols, is_m_tail=False
+                    )
+                else:
+                    group = TaskGroup()
+                    submit_b(group, n_round, 1, n_cols)
+                    submit_a_full(group, row_block)
+                    submit_c_full(group, row_block, n_round, 1, n_cols)
+                    overlap_with_previous(group)
+
+        if tail_n_cols:
+            for row_block in range(full_m_blocks):
+                if chunk_c_output:
+                    submit_chunked_panel(
+                        row_block,
+                        full_n_rounds,
+                        tail_n_cols,
+                        is_m_tail=False,
+                    )
+                else:
+                    group = TaskGroup()
+                    submit_b(group, full_n_rounds, 1, tail_n_cols)
+                    submit_a_full(group, row_block)
+                    submit_c_full(
+                        group, row_block, full_n_rounds, 1, tail_n_cols
+                    )
+                    overlap_with_previous(group)
+
+        if has_m_tail:
+            for n_round in range(config.logical_n_rounds):
+                active_cols = n_cols if n_round < full_n_rounds else tail_n_cols
+                if chunk_c_output:
+                    submit_chunked_panel(
+                        0, n_round, active_cols, is_m_tail=True
+                    )
+                else:
+                    group = TaskGroup()
+                    submit_b(group, n_round, 1, active_cols)
+                    submit_a_tail(group)
+                    submit_c_tail(group, n_round, active_cols)
+                    overlap_with_previous(group)
+
+        if pending_group is not None:
+            pending_group.finish()
+
+    runtime = Runtime(
+        sequence,
+        [A_ty, B_ty, C_ty, A_prods, B_prods, C_conses],
+    )
+    program = Program(dev, runtime, workers=flat_workers)
+    if trace_config:
+        raise ValueError(
+            "the eight-column high-performance fringe uses every shim column"
+        )
+    module = program.resolve_program()
+    if generate_taps:
+        return (
+            TensorAccessSequence.from_taps(A_taps),
+            TensorAccessSequence.from_taps(B_taps),
+            TensorAccessSequence.from_taps(C_taps),
+        )
+    return module
+
+
 def _build_design(
     dev,
     M: int,
@@ -2632,6 +3753,14 @@ def _build_design(
     )
     if accumulation_mode == "cascade-hybrid":
         return _build_cascade_hybrid_2way_design(
+            dev, config, trace_config, generate_taps=generate_taps
+        )
+    if config.uses_paired_m64_schedule:
+        return _build_paired_m64_design(
+            dev, config, trace_config, generate_taps=generate_taps
+        )
+    if config.needs_high_perf_256_schedule:
+        return _build_high_perf_256_design(
             dev, config, trace_config, generate_taps=generate_taps
         )
     if accumulation_mode == "cascade-shared":
@@ -2681,11 +3810,25 @@ def _build_design(
     )
     n_shim_a = min(N_AIE_ROWS, n_aie_cols)
     a_rows_per_shim = N_AIE_ROWS // n_aie_cols if n_aie_cols < 4 else 1
+    # Fold the smallest legal divisor of adjacent K tiles into each MemTile
+    # producer object. This bounds the shim outer loop at 64 even at K=32768.
+    # The MemTile reshapes each slab back into the original m_a x k consumer
+    # objects, so kernels and the external BF16 A contract are unchanged.
+    a_slab_tiles = (
+        config.dma_k_slab_tiles
+        if cache_mode == "l1-weight"
+        and n_aie_cols == 8
+        and config.n_k_tiles > NPU_DMA_MAX_OUTER_SIZE
+        else 1
+    )
+    a_slab_k = a_slab_tiles * k
 
     A_ty = np.ndarray[(M * K,), np.dtype[bfloat16]]
     B_ty = np.ndarray[(config.prepared_bytes,), np.dtype[np.uint8]]
     C_ty = np.ndarray[(M * N,), np.dtype[bfloat16]]
-    A_l2_ty = np.ndarray[(m_c * k * a_rows_per_shim,), np.dtype[bfloat16]]
+    A_l2_ty = np.ndarray[
+        (m_c * a_slab_k * a_rows_per_shim,), np.dtype[bfloat16]
+    ]
     A_l1_ty = np.ndarray[(m_a, k), np.dtype[bfloat16]]
     B_l1_ty = np.ndarray[(config.packed_rows, k), np.dtype[np.uint8]]
     B_l2_ty = (
@@ -2727,18 +3870,58 @@ def _build_design(
         (64, 1),
     ]
     for shim in range(n_shim_a):
-        parent = ObjectFifo(A_l2_ty, name=f"A_L3L2_{shim}", depth=2)
+        if a_slab_tiles > 1:
+            # Host order is [row][slab-K].  Store [K-tile][row][k]
+            # so K-tile and A-subtile form one legal egress dimension.
+            a_slab_from_l3: StreamDims = [
+                (m_c * a_rows_per_shim, k),
+                (a_slab_tiles, m_c * a_rows_per_shim * k),
+                (k, 1),
+            ]
+        else:
+            a_slab_from_l3 = None
+        parent = ObjectFifo(
+            A_l2_ty,
+            name=f"A_L3L2_{shim}",
+            depth=2,
+            dims_from_stream_per_cons=a_slab_from_l3,
+        )
         A_l3l2.append(parent)
         start = shim * a_rows_per_shim
         stop = start + a_rows_per_shim
-        children = parent.cons().split(
-            [m_c * k * row for row in range(a_rows_per_shim)],
-            obj_types=[A_l1_ty] * a_rows_per_shim,
-            names=[f"A_L2L1_{row}" for row in range(start, stop)],
-            depths=[config.a_fifo_depth] * a_rows_per_shim,
-            dims_to_stream=[a_to_stream] * a_rows_per_shim,
-            dims_from_stream=[a_from_stream] * a_rows_per_shim,
-        )
+        if a_slab_tiles > 1:
+            a_slab_to_stream: StreamDims = [
+                (a_slab_tiles * config.a_subtiles, m_a * k),
+                (k // 8, 8),
+                (m_a, k),
+                (8, 1),
+            ]
+            child = ObjectFifo(
+                A_l2_ty,
+                consumer_obj_type=A_l1_ty,
+                name=f"A_L2L1_{start}",
+                # Preserve the same compute-side ping-pong buffering as the
+                # ordinary (one-K-tile) path.  The slab changes only the
+                # MemTile producer object and shim descriptor geometry; a
+                # depth-one child otherwise serializes MemTile->L1 transfer
+                # behind every Q4 dequantize/MMUL iteration on long-K GEMMs.
+                depth=config.a_fifo_depth,
+                dims_to_stream=a_slab_to_stream,
+                dims_from_stream_per_cons=a_from_stream,
+            )
+            ObjectFifoLink(
+                parent.cons(), child.prod(), tile=Tile(2 * shim, 1)
+            )
+            children = [child]
+        else:
+            children = parent.cons().split(
+                [m_c * k * row for row in range(a_rows_per_shim)],
+                obj_types=[A_l1_ty] * a_rows_per_shim,
+                names=[f"A_L2L1_{row}" for row in range(start, stop)],
+                depths=[config.a_fifo_depth] * a_rows_per_shim,
+                dims_to_stream=[a_to_stream] * a_rows_per_shim,
+                dims_from_stream=[a_from_stream] * a_rows_per_shim,
+            )
         A_l2l1.extend(children)
 
     c_dims: StreamDims = [
@@ -2851,13 +4034,33 @@ def _build_design(
     workers = Worker.grid(N_AIE_ROWS, n_aie_cols, make_worker)
     flat_workers = [worker for row in workers for worker in row]
 
-    A_tiles = TensorTiler2D.group_tiler(
-        (M, K),
-        (m_c * a_rows_per_shim, k),
-        (1, K // k),
-        pattern_repeat=N // n // n_aie_cols,
-        prune_step=False,
-    )
+    if a_slab_tiles > 1:
+        A_tiles = [
+            TensorAccessPattern(
+                (M, K),
+                offset=(
+                    row_block * N_AIE_ROWS * m_c * K
+                    + shim * m_c * a_rows_per_shim * K
+                ),
+                sizes=[
+                    N // n // n_aie_cols,
+                    config.n_k_tiles // a_slab_tiles,
+                    m_c * a_rows_per_shim,
+                    a_slab_k,
+                ],
+                strides=[0, a_slab_k, K, 1],
+            )
+            for row_block in range(n_row_blocks)
+            for shim in range(n_shim_a)
+        ]
+    else:
+        A_tiles = TensorTiler2D.group_tiler(
+            (M, K),
+            (m_c * a_rows_per_shim, k),
+            (1, K // k),
+            pattern_repeat=N // n // n_aie_cols,
+            prune_step=False,
+        )
     if cache_mode == "memtile-weight":
         tiles_per_col = config.n_n_tiles // n_aie_cols
         panel_bytes = config.n_k_tiles * config.tile_bytes
@@ -2872,6 +4075,30 @@ def _build_design(
             for n_round in range(tiles_per_col)
             for col in range(n_aie_cols)
         ]
+    elif a_slab_tiles > 1:
+        # Keep the direct tile-sized B ObjectFIFO, but fold two adjacent
+        # tiles into the descriptor's third dimension.  The byte stream and
+        # tile lock boundaries are unchanged; only the shim loop geometry is
+        # shortened from 224 K iterations to 112 two-tile groups.
+        B_tiles = [
+            TensorAccessPattern(
+                (config.prepared_bytes,),
+                offset=tap.offset,
+                sizes=[
+                    config.n_n_tiles // n_aie_cols,
+                    config.n_k_tiles // a_slab_tiles,
+                    a_slab_tiles * config.packed_rows,
+                    config.k,
+                ],
+                strides=[
+                    config.n_k_tiles * config.tile_bytes,
+                    a_slab_tiles * config.tile_bytes,
+                    config.k,
+                    1,
+                ],
+            )
+            for tap in b_partition_taps(config)
+        ]
     else:
         B_tiles = [
             TensorAccessPattern(
@@ -2885,7 +4112,14 @@ def _build_design(
     C_tiles = TensorTiler2D.step_tiler(
         (M, N),
         (m_c * N_AIE_ROWS, n),
-        tile_group_repeats=(2, N // n // n_aie_cols),
+        # Ordinary builds submit two physical row waves per task group.  The
+        # exact M=256 specialization has only one wave, so constructing a
+        # two-wave tiler would reject the otherwise legal tensor before the
+        # runtime's existing partial-batch handling can select its sole TAP.
+        tile_group_repeats=(
+            1 if config.uses_exact_single_row_wave else 2,
+            N // n // n_aie_cols,
+        ),
         tile_group_steps=(1, n_aie_cols),
         prune_step=False,
     )
@@ -2963,18 +4197,37 @@ def _build_design(
         # A joined C object has N_AIE_ROWS * m_c rows.  NPU DMA dimensions
         # are limited to 1023, so large m_c tiles use one row block per drain
         # and expose the four joined compute rows as a separate dimension.
-        c_row_batch = 1 if N_AIE_ROWS * m_c > 1023 else 2
+        c_join_rows = N_AIE_ROWS * m_c
+        c_wide_row_stride = c_join_rows * N > NPU_DMA_MAX_STRIDE
+        c_row_batch = (
+            1
+            if c_join_rows > 1023
+            or c_wide_row_stride
+            or config.n_k_tiles > NPU_DMA_MAX_OUTER_SIZE
+            else 2
+        )
         n_rounds = N // n // n_aie_cols
         for row_base in range(0, n_row_blocks, c_row_batch):
             current_rows = min(c_row_batch, n_row_blocks - row_base)
             for col in range(n_aie_cols):
                 if c_row_batch == 1:
-                    c_tap = TensorAccessPattern(
-                        (M, N),
-                        offset=row_base * N_AIE_ROWS * m_c * N + col * n,
-                        sizes=[n_rounds, N_AIE_ROWS, m_c, n],
-                        strides=[n * n_aie_cols, m_c * N, N, 1],
-                    )
+                    if c_join_rows <= 1023:
+                        # The joined object is contiguous in host row order.
+                        # Flatten it so wide LLM projections use stride N,
+                        # rather than the unencodable m_c*N or pair stride.
+                        c_tap = TensorAccessPattern(
+                            (M, N),
+                            offset=row_base * c_join_rows * N + col * n,
+                            sizes=[n_rounds, 1, c_join_rows, n],
+                            strides=[n * n_aie_cols, 0, N, 1],
+                        )
+                    else:
+                        c_tap = TensorAccessPattern(
+                            (M, N),
+                            offset=row_base * c_join_rows * N + col * n,
+                            sizes=[n_rounds, N_AIE_ROWS, m_c, n],
+                            strides=[n * n_aie_cols, m_c * N, N, 1],
+                        )
                 else:
                     c_tap = C_tiles[c_index]
                     c_index += 1

@@ -17,3 +17,7 @@ __pycache__/
 *.pyc
 *.orig
 *.rej
+*.pdi
+generated_pdi_insts/
+pdi_gen.log
+manifest.csv

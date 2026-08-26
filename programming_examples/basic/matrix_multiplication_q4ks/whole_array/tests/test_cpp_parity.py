@@ -42,6 +42,48 @@ def main():
             raise AssertionError(completed.stdout)
         actual = np.fromfile(prepared_path, dtype=np.uint8)
         np.testing.assert_array_equal(actual, expected)
+
+        # Two columns own one additional N panel.  This catches any drift
+        # between Python and C++ prefix offsets for partial eight-column waves.
+        fringe_cfg = Q4KSConfig(
+            M=768,
+            K=256,
+            N=1280,
+            m_c=128,
+            m_a=32,
+            k=64,
+            n=128,
+            n_aie_cols=8,
+            compute_type="bfp16",
+            accumulation_mode="bf16",
+            cache_mode="l1-weight",
+            cache_k=256,
+        )
+        _, fringe_native = make_deterministic_native_q4_k(fringe_cfg)
+        fringe_expected = prepare_q4ks_weights(fringe_native, fringe_cfg)
+        fringe_native_path = Path(directory) / "fringe-native.bin"
+        fringe_prepared_path = Path(directory) / "fringe-prepared.bin"
+        fringe_native.tofile(fringe_native_path)
+        fringe_completed = subprocess.run(
+            [
+                str(executable),
+                "-M", "768", "-K", "256", "-N", "1280",
+                "--tile-m-c", "128", "--tile-m-a", "32",
+                "--tile-k", "64", "--tile-n", "128",
+                "--n-aie-cols", "8", "--compute-type", "bfp16",
+                "--accumulation-mode", "bf16", "--cache-mode", "l1-weight",
+                "--cache-k", "256", "--q4-k-file", str(fringe_native_path),
+                "--prepare-output", str(fringe_prepared_path),
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        if "PASS!" not in fringe_completed.stdout:
+            raise AssertionError(fringe_completed.stdout)
+        fringe_actual = np.fromfile(fringe_prepared_path, dtype=np.uint8)
+        np.testing.assert_array_equal(fringe_actual, fringe_expected)
+
         hybrid_cfg = Q4KSConfig(
             M=2048,
             K=1024,

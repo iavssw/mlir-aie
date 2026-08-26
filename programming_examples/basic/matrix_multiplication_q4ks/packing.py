@@ -33,6 +33,12 @@ MEMTILE_MEMORY_BYTES = 512 * 1024
 CORE_STACK_BYTES = 0xD00
 CORE_SAFETY_BYTES = 4 * 1024
 MEMTILE_SAFETY_BYTES = 32 * 1024
+# The outermost dimension of an NPU shim-DMA BD is six bits.  Larger logical
+# transfers must be emitted as a sequence of bounded TAPs.  A shim stride is
+# encoded in 20 bits, so paired output waves with a wider host-N dimension
+# must likewise be drained as individual N-panel/wave transfers.
+NPU_DMA_MAX_OUTER_SIZE = 64
+NPU_DMA_MAX_STRIDE = 1 << 20
 COMPUTE_TYPES = ("bf16", "bfp16", "int8")
 ACCUMULATION_MODES = (
     "bf16",
@@ -158,8 +164,58 @@ class Q4KSConfig:
         return self.K // self.k
 
     @property
+    def dma_k_slab_tiles(self) -> int:
+        """Smallest legal K-slab divisor for a shim DMA descriptor.
+
+        The shim's outer size is limited to 64.  Folding adjacent K tiles
+        into the packed-row dimension keeps that outer loop bounded, but the
+        folded packed rows and the contiguous A slab must each remain within
+        the 10-bit DMA dimension limit.  K is Q4_K-block aligned, so a legal
+        divisor exists for every supported fixed-tile shape through K=32768.
+        """
+
+        max_slab = min(1023 // self.packed_rows, 1023 // self.k)
+        for slab_tiles in range(1, max_slab + 1):
+            if (
+                self.n_k_tiles % slab_tiles == 0
+                and self.n_k_tiles // slab_tiles <= NPU_DMA_MAX_OUTER_SIZE
+            ):
+                return slab_tiles
+        raise ValueError(
+            "K cannot be represented by a bounded shim-DMA K slab for this tile"
+        )
+
+    @property
     def n_n_tiles(self) -> int:
         return self.N // self.n
+
+    @property
+    def full_n_rounds(self) -> int:
+        """Complete array-width N waves in the prepared-weight layout."""
+
+        return self.n_n_tiles // self.n_aie_cols
+
+    @property
+    def tail_n_cols(self) -> int:
+        """Number of active columns in the final partial N wave."""
+
+        return self.n_n_tiles % self.n_aie_cols
+
+    @property
+    def logical_n_rounds(self) -> int:
+        return self.full_n_rounds + (1 if self.tail_n_cols else 0)
+
+    def n_panels_for_col(self, col: int) -> int:
+        if not 0 <= col < self.n_aie_cols:
+            raise ValueError(f"AIE column {col} is outside the active array")
+        return self.full_n_rounds + (1 if col < self.tail_n_cols else 0)
+
+    def column_panel_offset(self, col: int) -> int:
+        """Prepared-B panel offset for a column, before its K tiles."""
+
+        if not 0 <= col < self.n_aie_cols:
+            raise ValueError(f"AIE column {col} is outside the active array")
+        return sum(self.n_panels_for_col(c) for c in range(col))
 
     @property
     def n_tiles(self) -> int:
@@ -179,7 +235,114 @@ class Q4KSConfig:
 
     @property
     def c_fifo_depth(self) -> int:
-        return 1 if self.m_c >= 128 else 2
+        # Keep ping-pong C storage for small output objects, but a single
+        # 16-KiB-or-larger object is already enough to cover the drain.  Base
+        # this on the actual tile footprint rather than m_c alone so the
+        # 64x128 output used by the large-K path does not reserve a redundant
+        # second 16-KiB buffer in the 64-KiB compute-tile memory.
+        return 1 if self.m_c >= 128 or self.m_c * self.n >= 8192 else 2
+
+    @property
+    def uses_paired_m64_schedule(self) -> bool:
+        """Whether two 64-row blocks share each Q4 dequantization.
+
+        The ordinary whole-array schedule requires an even number of array
+        row blocks.  This specialization keeps the 256-row physical wave of
+        ``m_c=64`` while pairing adjacent waves inside each worker.  A packed
+        B tile is prepared once and applied to four 32-row A subtiles, which
+        preserves the winning ``m_c=128`` kernel's weight-reuse ratio.  An
+        unpaired final wave is legal and supplies the 256-row granularity.
+        """
+
+        return (
+            self.n_aie_cols == 8
+            and (self.m_c, self.m_a, self.k, self.n) == (64, 32, 64, 128)
+            and self.compute_type == "bfp16"
+            and self.accumulation_mode == "bf16"
+            and self.cache_mode == "l1-weight"
+            and self.activation_input == "bf16"
+            # A single physical wave has no second 64-row block with which
+            # to share dequantized weights. Route M=256 through the ordinary
+            # exact-size schedule instead of duplicating A and C solely to
+            # satisfy the paired 128-row kernel ABI.
+            and self.M > self.m_c * N_AIE_ROWS
+        )
+
+    @property
+    def is_high_perf_256_tile(self) -> bool:
+        """The fixed 16-TOPS interior kernel and its supported host ABI."""
+
+        return (
+            self.n_aie_cols == 8
+            and (self.m_c, self.m_a, self.k, self.n) == (128, 32, 64, 128)
+            and self.compute_type == "bfp16"
+            and self.accumulation_mode == "bf16"
+            and self.cache_mode == "l1-weight"
+            and self.activation_input == "bf16"
+        )
+
+    @property
+    def supports_high_perf_256_contract(self) -> bool:
+        """Whether the high-performance tile can cover this logical shape.
+
+        Full array waves remain 512x1024.  A specialized runtime maps a final
+        256-row half-wave and a 256/512/768-column partial wave without
+        changing the compute kernel used by the aligned interior.
+        """
+
+        return (
+            self.is_high_perf_256_tile
+            and self.M % 256 == 0
+            and self.N % 256 == 0
+        )
+
+    @property
+    def needs_high_perf_256_schedule(self) -> bool:
+        """Whether ordinary whole-array ping-pong cannot express the shape."""
+
+        if not self.supports_high_perf_256_contract:
+            return False
+        row_waves, row_tail = divmod(self.M, self.m_c * N_AIE_ROWS)
+        ordinary_m = row_tail == 0 and (row_waves == 1 or row_waves % 2 == 0)
+        ordinary_n = self.tail_n_cols == 0
+        return not (ordinary_m and ordinary_n)
+
+    @property
+    def full_m_blocks(self) -> int:
+        return self.M // (self.m_c * N_AIE_ROWS)
+
+    @property
+    def has_high_perf_m_tail(self) -> bool:
+        return self.M % (self.m_c * N_AIE_ROWS) != 0
+
+    @property
+    def uses_exact_single_m64_schedule(self) -> bool:
+        """Whether one 256-row wave should use exact 64-row core objects."""
+
+        return (
+            self.n_aie_cols == 8
+            and (self.m_c, self.m_a, self.k, self.n) == (64, 32, 64, 128)
+            and self.compute_type == "bfp16"
+            and self.accumulation_mode == "bf16"
+            and self.cache_mode == "l1-weight"
+            and self.activation_input == "bf16"
+            and self.M == self.m_c * N_AIE_ROWS
+        )
+
+    @property
+    def uses_exact_single_row_wave(self) -> bool:
+        """Whether the matrix contains exactly one physical four-row wave."""
+
+        return self.M == self.m_c * N_AIE_ROWS
+
+    @property
+    def has_paired_m64_tail(self) -> bool:
+        """Whether the paired schedule ends with one unpaired 256-row wave."""
+
+        return (
+            self.uses_paired_m64_schedule
+            and (self.M // (self.m_c * N_AIE_ROWS)) % 2 == 1
+        )
 
     @property
     def a_fifo_depth(self) -> int:
@@ -195,8 +358,27 @@ class Q4KSConfig:
             "cascade-hybrid",
         ):
             return 1
+        # A depth-one 64-row A graph has deadlocked NPU2 in the analogous
+        # m_c=128 specialization. Prefer safe ping-pong buffering for larger
+        # activation subtiles whenever the complete bfp16/bf16 L1 footprint
+        # still fits; this also reduces bubbles in low-wave-count kernels.
+        if (
+            self.m_a >= 64
+            and self.compute_type == "bfp16"
+            and self.accumulation_mode == "bf16"
+            and self.cache_mode == "l1-weight"
+        ):
+            depth_two_bytes = (
+                2 * self.m_a * self.k * 2
+                + self.runtime_tile_bytes
+                + self.c_fifo_depth * self.m_c * self.n * 2
+                + self.k * self.n * 9 // 8
+                + CORE_STACK_BYTES
+                + CORE_SAFETY_BYTES
+            )
+            if depth_two_bytes <= CORE_MEMORY_BYTES:
+                return 2
         return 1 if self.m_a >= 64 else 2
-
 
     def prepared_tile_bytes(self, storage_type: str) -> int:
         if storage_type == "q4":
@@ -283,6 +465,11 @@ class Q4KSConfig:
             "stack": CORE_STACK_BYTES,
             "safety margin": CORE_SAFETY_BYTES,
         }
+        if self.uses_paired_m64_schedule:
+            # Two independent 64x128 result FIFOs are live while a prepared
+            # B tile is reused across both.  Their combined footprint equals
+            # the original high-throughput 128x128 result object.
+            components[f"C FIFO (depth {self.c_fifo_depth})"] *= 2
         if self.accumulation_mode in ("fp32", "cascade", "cascade-resident"):
             components["FP32 accumulation scratch"] = self.m_c * self.n * 4
         if self.accumulation_mode == "cascade-resident":
@@ -403,6 +590,15 @@ class Q4KSConfig:
             raise ValueError("k must divide K")
         if self.m_c % self.m_a:
             raise ValueError("m_a must divide m_c")
+        if (
+            self.compute_type == "bfp16"
+            and self.accumulation_mode == "bf16"
+            and (self.m_c, self.m_a, self.k, self.n) == (128, 64, 64, 128)
+        ):
+            raise ValueError(
+                "m_c=128, m_a=64, k=64, n=128 is disabled: the depth-one "
+                "A ObjectFIFO deadlocks NPU2; use m_a=32"
+            )
         if self.accumulation_mode != "bf16" and self.compute_type != "bfp16":
             raise ValueError("FP32 and cascade accumulation require bfp16 compute")
         if self.accumulation_mode == "cascade":
@@ -503,11 +699,23 @@ class Q4KSConfig:
                 )
         if self.n % 16:
             raise ValueError("n must be divisible by 16")
-        if self.M % (self.m_c * N_AIE_ROWS):
-            raise ValueError("M must be divisible by m_c * 4 AIE rows")
-        if self.N % (self.n * self.n_aie_cols):
-            raise ValueError("N must be divisible by n * n_aie_cols")
-        if (self.M // (self.m_c * N_AIE_ROWS)) % 2:
+        if self.supports_high_perf_256_contract:
+            # The fixed high-throughput tile has a specialized half-M and
+            # partial-N wave.  Other configurations retain exact physical
+            # array-wave divisibility.
+            if self.M % 256 or self.N % 256:
+                raise ValueError("high-performance M and N must be 256-aligned")
+        else:
+            if self.M % (self.m_c * N_AIE_ROWS):
+                raise ValueError("M must be divisible by m_c * 4 AIE rows")
+            if self.N % (self.n * self.n_aie_cols):
+                raise ValueError("N must be divisible by n * n_aie_cols")
+        if (
+            (self.M // (self.m_c * N_AIE_ROWS)) % 2
+            and not self.uses_paired_m64_schedule
+            and not self.uses_exact_single_row_wave
+            and not self.needs_high_perf_256_schedule
+        ):
             raise ValueError("M / (m_c * 4) must be even for ping-pong scheduling")
         assert self.cache_k is not None
         if self.cache_k % QK_K or self.K % self.cache_k:
@@ -515,7 +723,7 @@ class Q4KSConfig:
 
         dma_sizes = {
             "K/k": self.n_k_tiles,
-            "N/(n*cols)": self.n_n_tiles // self.n_aie_cols,
+            "N/(n*cols)": self.logical_n_rounds,
             "packed_rows": self.packed_rows,
             "k": self.k,
             "m_a": self.m_a,
@@ -585,8 +793,8 @@ class Q4KSConfig:
 class TapSpec:
     tensor: str
     offset: int
-    sizes: tuple[int, int, int, int]
-    strides: tuple[int, int, int, int]
+    sizes: tuple[int, ...]
+    strides: tuple[int, ...]
     column: int
     row_block: int | None = None
 
@@ -595,6 +803,19 @@ class TapSpec:
         return int(np.prod(self.sizes))
 
     def indices(self) -> Iterator[int]:
+        if len(self.sizes) == 3 and len(self.strides) == 3:
+            for i0 in range(self.sizes[0]):
+                for i1 in range(self.sizes[1]):
+                    for i2 in range(self.sizes[2]):
+                        yield (
+                            self.offset
+                            + i0 * self.strides[0]
+                            + i1 * self.strides[1]
+                            + i2 * self.strides[2]
+                        )
+            return
+        if len(self.sizes) != 4 or len(self.strides) != 4:
+            raise ValueError("TAP sizes and strides must both have rank 3 or 4")
         for i0 in range(self.sizes[0]):
             for i1 in range(self.sizes[1]):
                 for i2 in range(self.sizes[2]):
@@ -772,9 +993,8 @@ def make_deterministic_native_q4_k(
 
 
 def _tile_coordinates(config: Q4KSConfig) -> Iterable[tuple[int, int, int]]:
-    per_col = config.n_n_tiles // config.n_aie_cols
     for col in range(config.n_aie_cols):
-        for n_round in range(per_col):
+        for n_round in range(config.n_panels_for_col(col)):
             n_tile = col + n_round * config.n_aie_cols
             for k_tile in range(config.n_k_tiles):
                 yield col, k_tile, n_tile
@@ -1202,13 +1422,18 @@ def reference_matmul(
 
 
 def b_partition_taps(config: Q4KSConfig) -> list[TapSpec]:
-    tiles_per_col = config.n_n_tiles // config.n_aie_cols
-    bytes_per_col = tiles_per_col * config.n_k_tiles * config.tile_bytes
     return [
         TapSpec(
             "B",
-            col * bytes_per_col,
-            (tiles_per_col, config.n_k_tiles, config.packed_rows, config.k),
+            config.column_panel_offset(col)
+            * config.n_k_tiles
+            * config.tile_bytes,
+            (
+                config.n_panels_for_col(col),
+                config.n_k_tiles,
+                config.packed_rows,
+                config.k,
+            ),
             (
                 config.n_k_tiles * config.tile_bytes,
                 config.tile_bytes,
@@ -1267,4 +1492,111 @@ def c_transfer_taps(config: Q4KSConfig) -> list[TapSpec]:
                     row_base,
                 )
             )
+    return taps
+
+
+def paired_m64_a_transfer_taps(config: Q4KSConfig) -> list[TapSpec]:
+    """Contiguous 128-row A transfers for the paired-m64 schedule.
+
+    Each core receives one parent object that the MemTile splits into four
+    32-row compute subtiles.  This uses one host-to-MemTile DMA channel and
+    keeps one prepared B tile live across all 128 activation rows.
+    """
+
+    if not config.uses_paired_m64_schedule:
+        raise ValueError("paired-m64 A TAPs require the paired-m64 configuration")
+    n_row_blocks = config.M // (config.m_c * N_AIE_ROWS)
+    full_pairs, tail = divmod(n_row_blocks, 2)
+    n_rounds = config.n_n_tiles // config.n_aie_cols
+    slab_tiles = config.dma_k_slab_tiles
+    slab_k = slab_tiles * config.k
+    taps: list[TapSpec] = []
+    for pair in range(full_pairs):
+        row_block = pair * 2
+        for row in range(N_AIE_ROWS):
+            taps.append(
+                TapSpec(
+                    "A",
+                    row_block * N_AIE_ROWS * config.m_c * config.K
+                    + row * 2 * config.m_c * config.K,
+                    (
+                        n_rounds,
+                        config.n_k_tiles // slab_tiles,
+                        2 * config.m_c,
+                        slab_k,
+                    ),
+                    (0, slab_k, config.K, 1),
+                    row,
+                    row_block,
+                )
+            )
+    if tail:
+        row_base = full_pairs * 2
+        for _n_round in range(n_rounds):
+            for row in range(N_AIE_ROWS):
+                source_row = (row // 2) * 2
+                taps.append(
+                    TapSpec(
+                        "A",
+                        row_base * N_AIE_ROWS * config.m_c * config.K
+                        + source_row * config.m_c * config.K,
+                        (
+                            config.n_k_tiles // slab_tiles,
+                            2 * config.m_c,
+                            slab_k,
+                        ),
+                        (slab_k, config.K, 1),
+                        row,
+                        row_base,
+                    )
+                )
+    return taps
+
+
+def paired_m64_c_transfer_taps(config: Q4KSConfig) -> list[TapSpec]:
+    """One joined C0/C1 drain per column in runtime submission order."""
+
+    if not config.uses_paired_m64_schedule:
+        raise ValueError("paired-m64 C TAPs require the paired-m64 configuration")
+    n_row_blocks = config.M // (config.m_c * N_AIE_ROWS)
+    full_pairs, tail = divmod(n_row_blocks, 2)
+    n_rounds = config.n_n_tiles // config.n_aie_cols
+    taps: list[TapSpec] = []
+    for pair in range(full_pairs):
+        row_block = pair * 2
+        for col in range(config.n_aie_cols):
+            taps.append(
+                TapSpec(
+                    "C",
+                    row_block * N_AIE_ROWS * config.m_c * config.N
+                    + col * config.n,
+                    (n_rounds, 2 * N_AIE_ROWS, config.m_c, config.n),
+                    (
+                        config.n * config.n_aie_cols,
+                        config.m_c * config.N,
+                        config.N,
+                        1,
+                    ),
+                    col,
+                    row_block,
+                )
+            )
+    if tail:
+        row_block = full_pairs * 2
+        for n_round in range(n_rounds):
+            for chunk in range(2 * N_AIE_ROWS):
+                row = chunk // 2
+                for col in range(config.n_aie_cols):
+                    taps.append(
+                        TapSpec(
+                            "C",
+                            row_block * N_AIE_ROWS * config.m_c * config.N
+                            + row * config.m_c * config.N
+                            + (n_round * config.n_aie_cols + col) * config.n,
+                            (1, 1, config.m_c, config.n),
+                            (1, 1, config.N, 1),
+                            col,
+                            row_block,
+                        )
+                    )
     return taps
